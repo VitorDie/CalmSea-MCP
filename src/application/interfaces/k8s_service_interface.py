@@ -32,3 +32,8 @@ class K8sServiceInterface(ABC):
     def delete_resource(self, resource_type: str, name: str, namespace: str) -> Any:
         """Remove um recurso do cluster."""
         pass
+
+    @abstractmethod
+    def scale_resource(self, resource_type: str, name: str, namespace: str, replicas: int) -> Any:
+        """Altera o número de réplicas de um recurso (Deployment/StatefulSet)."""
+        pass

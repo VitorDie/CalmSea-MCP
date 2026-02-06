@@ -7,4 +7,5 @@ __pycache__
 *.db-journal
 
 public
-variaveis.sh
+variaveis.shvenv/
+__pycache__/

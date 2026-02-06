@@ -27,3 +27,8 @@ class K8sServiceInterface(ABC):
     def apply_manifest(self, manifest: Dict[str, Any], namespace: str) -> Dict[str, Any]:
         """Aplica (Cria ou Atualiza) um recurso Kubernetes via dicionário/YAML."""
         pass
+
+    @abstractmethod
+    def delete_resource(self, resource_type: str, name: str, namespace: str) -> Any:
+        """Remove um recurso do cluster."""
+        pass

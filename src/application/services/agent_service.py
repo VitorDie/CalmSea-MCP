@@ -11,6 +11,10 @@ from src.application.tools_definitions import TOOLS_SCHEMA
 from src.application.use_cases.list_resources_command import ListResourcesCommand
 from src.application.use_cases.get_pod_logs_command import GetPodLogsCommand
 from src.application.use_cases.list_namespaces_command import ListNamespacesCommand
+from src.application.use_cases.get_resource_details_command import GetResourceDetailsCommand
+from src.application.use_cases.delete_resource_command import DeleteResourceCommand
+from src.application.use_cases.scale_resource_command import ScaleResourceCommand
+from src.application.use_cases.apply_manifest_command import ApplyManifestCommand
 
 class AgentService:
     def __init__(self, llm_provider: LLMProviderInterface, k8s_adapter: K8sServiceInterface):
@@ -50,7 +54,7 @@ class AgentService:
             args = decision.get("tool_args", {})
 
             try:
-                result = self._dispatch_tool(tool_name, args)
+                result = self._execute_tool(tool_name, args)
                 # Opcional: Poderíamos enviar o resultado de volta pro LLM para ele resumir.
                 # Por enquanto, retornamos o resultado bruto (JSON/String) para ser rápido.
                 return f"✅ **Executado {tool_name}:**\n\n```json\n{result}\n```"
@@ -61,25 +65,51 @@ class AgentService:
         else:
             return f"⚠️ Erro no Agente: {decision.get('content')}"
 
-    def _dispatch_tool(self, tool_name: str, args: Dict[str, Any]):
-        """
-        O 'Hub' que direciona o nome da ferramenta para o Command correto.
-        """
-        if tool_name == "list_resources":
-            # O LLM pode mandar 'resource_types' ou não. Garante que seja lista.
-            r_types = args.get("resource_types", ["pods"]) 
-            ns = args.get("namespace", "default")
-            return ListResourcesCommand(self.k8s_adapter).execute(r_types, ns)
+    def _execute_tool(self, tool_name: str, args: Dict[str, Any]):
+        try:
+            # --- LEITURA ---
+            if tool_name == "list_resources":
+                r_types = args.get("resource_types", ["pods"])
+                if isinstance(r_types, str): r_types = [r_types]
+                result = ListResourcesCommand(self.k8s_adapter).execute(r_types, args.get("namespace", "default"))
+                return f"✅ **Lista de Recursos:**\n```json\n{result}\n```"
 
-        elif tool_name == "get_pod_logs":
-            return GetPodLogsCommand(self.k8s_adapter).execute(
-                pod_name=args["pod_name"],
-                namespace=args["namespace"],
-                tail_lines=args.get("tail_lines", 50)
-            )
+            elif tool_name == "get_resource_details":
+                result = GetResourceDetailsCommand(self.k8s_adapter).execute(
+                    args["resource_type"], args["name"], args["namespace"]
+                )
+                return f"🔍 **Detalhes:**\n```json\n{result}\n```"
 
-        elif tool_name == "list_namespaces":
-            return ListNamespacesCommand(self.k8s_adapter).execute()
+            elif tool_name == "get_pod_logs":
+                result = GetPodLogsCommand(self.k8s_adapter).execute(
+                    args["pod_name"], args["namespace"], args.get("tail_lines", 50)
+                )
+                return f"📜 **Logs:**\n```log\n{result}\n```"
 
-        else:
-            raise ValueError(f"Ferramenta desconhecida: {tool_name}")
+            elif tool_name == "list_namespaces":
+                result = ListNamespacesCommand(self.k8s_adapter).execute()
+                return f"🌐 **Namespaces:**\n{result}"
+
+            # --- AÇÕES DESTRUTIVAS / MODIFICAÇÃO ---
+            elif tool_name == "delete_resource":
+                result = DeleteResourceCommand(self.k8s_adapter).execute(
+                    args["resource_type"], args["name"], args["namespace"]
+                )
+                return f"🗑️ **Deletado:** {result}"
+
+            elif tool_name == "scale_resource":
+                result = ScaleResourceCommand(self.k8s_adapter).execute(
+                    args["resource_type"], args["name"], int(args["replicas"]), args["namespace"]
+                )
+                return f"⚖️ **Escalado:** {result}"
+
+            elif tool_name == "apply_manifest":
+                result = ApplyManifestCommand(self.k8s_adapter).execute(
+                    args["manifest"], args["namespace"]
+                )
+                return f"🚀 **Aplicado:** {result}"
+
+            else:
+                return f"❌ Ferramenta desconhecida: {tool_name}"
+        except Exception as e:
+            return f"❌ Erro na execução: {str(e)}" 

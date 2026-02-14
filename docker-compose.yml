@@ -1,54 +1,31 @@
 services:
-  agentk-server:
-    build:
-      context: ./server
-      dockerfile: Dockerfile
-    container_name: agentk-mcp-server
-    ports:
-      - "3333:3333"
+  agentk:
+    build: .
+    container_name: agentk-mcp
+    
+    # [TRUQUE DO LINUX]
+    # "host" faz o container usar a mesma rede do seu computador.
+    # Isso permite acessar:
+    # 1. Ollama em localhost:11434
+    # 2. Minikube IP
+    network_mode: "host"
+
     environment:
-      - PYTHONUNBUFFERED=${PYTHONUNBUFFERED:-1}
-      - FASTMCP_HOST=${FASTMCP_HOST:-0.0.0.0}
-      - FASTMCP_PORT=${FASTMCP_PORT:-3333}
-      - KUBECONFIG=/app/config
+      # Passa a chave da OpenAI se estiver no .env ou variável de ambiente
       - OPENAI_API_KEY=${OPENAI_API_KEY}
+      # Força o Python a ver a pasta src
+      - PYTHONPATH=/app
+    
     volumes:
-      - /home/ftt_grupotcc2026_1/AgentK-MCP/kubeconfig:/app/config:ro
-    networks:
-      - agentk-network
-    restart: unless-stopped
-    extra_hosts:
-      - "host.docker.internal:host-gateway"
-    command: ["python", "app/main.py", "--port", "3333"]
+      # 1. Hot Reload: Se você mudar código na pasta src/, o container atualiza
+      - ./src:/app/src
+      
+      # 2. Kubeconfig: Mapeia seu arquivo de config para o root do container
+      - ~/.kube/config:/root/.kube/config
+      
+      # 3. Certificados Minikube: O config do K8s procura certs em /home/vitordie/.minikube
+      # Precisamos garantir que esse caminho exista DENTRO do container igualzinho fora.
+      - ~/.minikube:${HOME}/.minikube
 
-  agentk-client:
-    build:
-      context: ./client
-      dockerfile: Dockerfile
-    container_name: agentk-streamlit-client
-    ports:
-      - "8501:8501"
-    environment:
-      - PYTHONUNBUFFERED=${PYTHONUNBUFFERED:-1}
-      - STREAMLIT_SERVER_HEADLESS=${STREAMLIT_SERVER_HEADLESS:-true}
-      - STREAMLIT_SERVER_ENABLE_CORS=${STREAMLIT_SERVER_ENABLE_CORS:-false}
-      # # URL raiz, como você confirmou que era o original:
-      # - MCP_SERVER_URL=${MCP_SERVER_URL:-http://agentk-server:3333}
-      # URL correta para o endpoint SSE
-      - MCP_SERVER_URL=${MCP_SERVER_URL:-http://agentk-server:3333/sse}
-      - OPENAI_API_KEY=${OPENAI_API_KEY}
-    networks:
-      - agentk-network
-    depends_on:
-      agentk-server:
-        condition: service_healthy
-    restart: unless-stopped
-
-networks:
-  agentk-network:
-    driver: bridge
-    name: agentk-network
-
-volumes:
-  agentk-logs:
-    driver: local
+    # Reinicia se falhar (mas não se você parar manualmente)
+    restart: on-failure

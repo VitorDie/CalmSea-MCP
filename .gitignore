@@ -10,3 +10,11 @@ public
 variaveis.shvenv/
 __pycache__/
 venv/
+
+# .gitignore
+certs-remotos/
+remote-kubeconfig.yaml
+*.key
+*.crt
+logs/
+.env

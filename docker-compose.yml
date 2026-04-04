@@ -1,6 +1,6 @@
 services:
 
-# --- TESTES UNITÁRIOS ---
+  # --- TESTES UNITÁRIOS ---
   # Focados em lógica pura, sem depender de rede ou K8s real (usa mocks)
   tests-unit:
     build: .
@@ -71,6 +71,7 @@ services:
       - ./logs:/app/logs 
       - ./tests:/app/tests 
 
+  # --- TESTE DE PERFORMANCE ---
   performancetest:
     build: .
     container_name: performance-test

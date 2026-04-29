@@ -7,21 +7,21 @@ from src.infrastructure.llm.ollama_adapter import OllamaAdapter
 from src.adapters.llm.metrics_decorator import LLMMonitorDecorator
 from src.infrastructure.k8s_adapter.service import K8sServiceAdapter
 from src.infrastructure.metrics.collector import TCCMetricsCollector
+from src.infrastructure.k8s_adapter.scenario_manager import K8sScenarioManager
+from src.infrastructure.k8s_adapter.health_checker import K8sHealthChecker
 
 class PerformanceTestRunner:
     def __init__(self):
-        # adicione aqui os modelos que deseja testar
         self.models = ["llama3.1"]
-
-        # adicione aqui os arquivos YAML que deseja testar, seguindo a nomenclatura "1-orion.yaml", "2-frontend.yaml", etc.
-        # os arquivos devem estar na pasta "docs/tests/scenarios/" 
         self.yamls = [
             "1-orion.yaml", "2-frontend.yaml", "3-mysql.yaml", "4-vllm.yaml", 
             "5-nginx.yaml", "6-selenium.yaml", "7-elasticsearch.yaml", 
-            "8-newrelic.yaml", "9-storm.yaml", "10-mongodb.yaml"
+            "8-newrelic.yaml", "9-storm.yaml", "10-mongodb.yaml", "fiware-minikube.yaml"
         ]
-        self.reps = 1 # 5
+        self.reps = 1
         self.collector = TCCMetricsCollector()
+        self.env_mgr = K8sScenarioManager()
+        self.health = K8sHealthChecker()
 
     def get_agent(self, model_name):
         k8s = K8sServiceAdapter()
@@ -39,93 +39,50 @@ class PerformanceTestRunner:
         for model in self.models:
             output_dir = f"results/{model.replace(':', '-')}"
             os.makedirs(output_dir, exist_ok=True)
-            
-            for yaml in self.yamls:
-                for r in range(1, self.reps + 1):
-                    print(f"🚀 Model: {model} | File: {yaml} | Rep: {r}")
-                    
-                    # 1. Limpeza e Aplicação do cenário original
-                    os.system("kubectl delete deployment,pod,svc,hpa,daemonset,rc --all -n default --force --grace-period=0 > /dev/null 2>&1")
-                    os.system(f"kubectl apply -f docs/tests/scenarios/{yaml} > /dev/null 2>&1")
-                    time.sleep(5) # Delay para o Minikube-Docker processar
 
-                    # 2. Leitura do YAML
-                    yaml_path = f"docs/tests/scenarios/{yaml}"
-                    try:
-                        with open(yaml_path, "r") as f:
-                            yaml_content = f.read()
-                    except FileNotFoundError:
-                        print(f"❌ Arquivo não encontrado: {yaml_path}")
-                        continue
+            for yaml_file in self.yamls:
+                # 1. Setup K8s (Cria o ringue de teste)
+                ns = self.env_mgr.prepare(yaml_file)
+                time.sleep(5) # Tempo para o K8s processar o namespace
+                
+                # 2. Captura o YAML Vivo (O que a IA vai auditar)
+                live_yaml = self.env_mgr.get_live_yaml(ns, f"docs/tests/scenarios/{yaml_file}")
 
-                    # 3. Ciclo Único do Agente (Análise + Explicação + Fix)
-                    agent = self.get_agent(model)
+                # 3. Agente (O Decorator chama o record() e preenche o buffer aqui)
+                agent = self.get_agent(model)
+                sys_instruction = (
+                    "Você é um Auditor de Segurança K8s. Analise o YAML enviado, "
+                    "identifique falhas e use a ferramenta 'apply_manifest' para corrigir."
+                )
+                prompt = f"Corrija o recurso no namespace {ns}:\n\n{live_yaml}"
+                full_res = agent.run(prompt, system_instruction=sys_instruction) 
 
-                    sys_instruction = (
-                        "Você é um Auditor de Segurança K8s e Automação de Infraestrutura. "
-                        "Sua tarefa é: 1. Analisar o YAML e listar erros. "
-                        "2. Explicar didaticamente o que será corrigido. "
-                        "3. Usar a ferramenta 'apply_manifest' com o YAML final corrigido."
-                    )
-                    
-                    prompt = f"Analise, explique as falhas e aplique as correções para este YAML:\n\n{yaml_content}"
-                    
-                    # Chamada única: mais rápido e mantém o contexto
-                    full_res = agent.run(prompt, system_instruction=sys_instruction)
-                    
-                    # 4. Verificação e Salvamento
-                    time.sleep(2)
-                    verify = os.popen("kubectl get pods,svc").read()
-                    
-                    # Salvamos a resposta completa (Explicação + JSON da Tool)
-                    self.save_md(output_dir, yaml, r, "Análise e Explicação", full_res, verify)
-                    print(f"✅ Rep {r} concluída.")
+                # 4. Health Check (O veredito real do cluster)
+                is_ok, msg = self.health.check_health(ns)
 
-#    def run(self):
-#        for model in self.models:
-#            output_dir = f"results/{model.replace(':', '-')}"
-#            os.makedirs(output_dir, exist_ok=True)
-#            
-#            for yaml in self.yamls:
-#                for r in range(1, self.reps + 1):
-#                    print(f"🚀 Model: {model} | File: {yaml} | Rep: {r}")
-#                    
-#                    # 1 & 2. Limpeza e Aplicação
-#                    os.system("kubectl delete all --all -n default --force")
-#                    os.system(f"kubectl apply -f docs/tests/scenarios/{yaml}")
-#                    time.sleep(3) # Wait for K8s
-#
-#                    # 3. Ler o conteúdo do arquivo YAML para enviar à IA
-#                    yaml_path = f"docs/tests/scenarios/{yaml}"
-#                    try:
-#                        with open(yaml_path, "r") as f:
-#                            yaml_content = f.read()
-#                    except FileNotFoundError:
-#                        print(f"❌ Arquivo não encontrado: {yaml_path}")
-#                        continue
-#
-#                    # 3, 4, 5 & 6. Ciclo do Agente
-#                    agent = self.get_agent(model)
-#
-#                    sys_analise = "Você é um auditor de segurança K8s sênior. Sua resposta deve listar os erros encontrados."
-#                    prompt_analise = f"""Analise este YAML de produção:\n\n{yaml_content}\n"""
-#                    # Forçando a instrução de sistema através do agent.run (que repassa pro llm_provider)
-#                    analysis = agent.run(prompt_analise, system_instruction=sys_analise)
-#
-#                    sys_fix = "Você é uma automação de infraestrutura. VOCÊ ESTÁ PROIBIDO DE EXPLICAR OU RESPONDER COM TEXTO. SUA ÚNICA FUNÇÃO É USAR A FERRAMENTA 'apply_manifest' COM O YAML CORRIGIDO."
-#                    prompt_fix = f"""Aqui está o YAML original com problemas: {yaml_content} Gere o YAML corrigido (credenciais, imagens e seletores) e APLIQUE-O IMEDIATAMENTE usando a ferramenta apply_manifest. NÃO ESCREVA TEXTO, APENAS CHAME A FERRAMENTA."""
-#                    fix_res = agent.run(prompt_fix, system_instruction=sys_fix)
-#                    
-#                    # 7. Verificação Final
-#                    verify = os.popen("kubectl get pods").read()
-#                    
-#                    # 8. Exportação
-#                    self.save_md(output_dir, yaml, r, analysis, fix_res, verify)
+                # 5. Finalização (Escreve no CSV e gera o Markdown)
+                self.save_results(model, yaml_file, full_res, is_ok, msg, ns)
 
-    def save_md(self, path, yaml, r, analysis, fix, verify):
+    def save_results(self, model, yaml_file, full_res, is_ok, health_msg, ns):
+        # Manda o Coletor escrever no CSV de 8 colunas com o veredito final
+        self.collector.commit(is_ok, health_msg)
+
+        # Salva o Markdown (opcional, mas bom para sua auditoria)
+        output_dir = f"results/{model.replace(':', '-')}"
+        verify_output = os.popen(f"kubectl get all -n {ns}").read()
+        self.save_md(output_dir, yaml_file, 1, str(full_res), "Tool Call", verify_output, is_ok, health_msg)
+
+    def save_md(self, path, yaml, r, analysis, fix, verify, is_ok, health_msg):
+        status_icon = "✅" if is_ok else "❌"
         fname = f"{path}/Teste_{yaml.split('-')[0]}.{r}_{datetime.now().strftime('%H%M%S')}.md"
+        
         with open(fname, "w") as f:
-            f.write(f"# Teste {yaml} - Rep {r}\n\n## Análise\n{analysis}\n\n## Fix\n{fix}\n\n## K8s\n```\n{verify}```")
+            f.write(f"# Relatório: {yaml} - Rep {r}\n\n")
+            f.write(f"## Status Final: {status_icon} {'SUCESSO' if is_ok else 'FALHA'}\n")
+            f.write(f"**Veredito:** {health_msg}\n\n---\n\n")
+            f.write(f"## 🔍 Análise\n{analysis}\n\n")
+            f.write(f"## 🛠️ Fix Aplicado\n```yaml\n{fix}\n```\n\n")
+            f.write(f"## 📋 Cluster Snapshot\n```\n{verify}```")
 
 if __name__ == "__main__":
     PerformanceTestRunner().run()

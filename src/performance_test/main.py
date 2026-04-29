@@ -63,14 +63,28 @@ class PerformanceTestRunner:
                 # 5. Finalização (Escreve no CSV e gera o Markdown)
                 self.save_results(model, yaml_file, full_res, is_ok, msg, ns)
 
+#    def save_results(self, model, yaml_file, full_res, is_ok, health_msg, ns):
+#        # Manda o Coletor escrever no CSV de 8 colunas com o veredito final
+#        self.collector.commit(is_ok, health_msg)
+#
+#        # Salva o Markdown (opcional, mas bom para sua auditoria)
+#        output_dir = f"results/{model.replace(':', '-')}"
+#        verify_output = os.popen(f"kubectl get all -n {ns}").read()
+#        self.save_md(output_dir, yaml_file, 1, str(full_res), "Tool Call", verify_output, is_ok, health_msg)
+
     def save_results(self, model, yaml_file, full_res, is_ok, health_msg, ns):
-        # Manda o Coletor escrever no CSV de 8 colunas com o veredito final
+        # Manda o Coletor escrever no CSV
         self.collector.commit(is_ok, health_msg)
 
-        # Salva o Markdown (opcional, mas bom para sua auditoria)
         output_dir = f"results/{model.replace(':', '-')}"
         verify_output = os.popen(f"kubectl get all -n {ns}").read()
-        self.save_md(output_dir, yaml_file, 1, str(full_res), "Tool Call", verify_output, is_ok, health_msg)
+        
+        # Tenta pegar o código do fix se o seu AgentService retornar um objeto estruturado
+        # Se full_res for apenas string, ele usa a string toda.
+        fix_content = getattr(full_res, 'tool_calls', "Código não extraído") 
+        
+        # 1 é a repetição (ajuste se usar o loop de reps)
+        self.save_md(output_dir, yaml_file, 1, str(full_res), fix_content, verify_output, is_ok, health_msg)
 
     def save_md(self, path, yaml, r, analysis, fix, verify, is_ok, health_msg):
         status_icon = "✅" if is_ok else "❌"

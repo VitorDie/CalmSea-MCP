@@ -12,7 +12,7 @@ from src.infrastructure.k8s_adapter.health_checker import K8sHealthChecker
 
 class PerformanceTestRunner:
     def __init__(self):
-        self.models = ["llama3.1"]
+        self.models = ["llama3.1:8b"]
         self.yamls = [
             "1-orion.yaml", "2-frontend.yaml", "3-mysql.yaml", "4-vllm.yaml", 
             "5-nginx.yaml", "6-selenium.yaml", "7-elasticsearch.yaml", 
@@ -36,6 +36,21 @@ class PerformanceTestRunner:
         return AgentService(llm_provider=monitored_llm, k8s_adapter=k8s)
 
     def run(self):
+        # Mapeamento dinâmico para a primeira linha do prompt
+        scenario_headers = {
+            "1-orion.yaml": "Serviço: fiware-orionld-service Deployment: fiware-orionld HPA: fiware-orionld-hpa",
+            "2-frontend.yaml": "Deployment: frontend",
+            "3-mysql.yaml": "Pod: mysql",
+            "4-vllm.yaml": "Deployment: vllm-gemma-deployment",
+            "5-nginx.yaml": "Serviço: nginxsvc ReplicationController: my-nginx",
+            "6-selenium.yaml": "Serviço: selenium-hub Deployment: selenium-hub",
+            "7-elasticsearch.yaml": "Serviço: elasticsearch ReplicationController: es",
+            "8-newrelic.yaml": "DaemonSet: newrelic-agent",
+            "9-storm.yaml": "Deployment: storm-worker-controller",
+            "10-mongodb.yaml": "Serviço: mongodb-service Deployment: mongodb-deployment",
+            "fiware-minikube.yaml": "Serviço: fiware-service Deployment: fiware-deployment" # Fallback para o minikube
+        }
+
         for model in self.models:
             output_dir = f"results/{model.replace(':', '-')}"
             os.makedirs(output_dir, exist_ok=True)
@@ -43,24 +58,37 @@ class PerformanceTestRunner:
             for yaml_file in self.yamls:
                 # 1. Setup K8s (Cria o ringue de teste)
                 ns = self.env_mgr.prepare(yaml_file)
-                time.sleep(5) # Tempo para o K8s processar o namespace
+                time.sleep(5) 
                 
-                # 2. Captura o YAML Vivo (O que a IA vai auditar)
+                # 2. Captura o YAML Vivo (Ambiente real)
                 live_yaml = self.env_mgr.get_live_yaml(ns, f"docs/tests/scenarios/{yaml_file}")
 
-                # 3. Agente (O Decorator chama o record() e preenche o buffer aqui)
+                # 3. Construção do Prompt Padronizado
+                header = scenario_headers.get(yaml_file, f"Arquivo: {yaml_file}")
+                
+                prompt = (
+                    f"{header}\n"
+                    "Analise os arquivos YAML dos recursos Kubernetes acima, procurando por misconfigurations "
+                    "e possíveis incoerências, considerando o deploy em ambiente de produção\n"
+                    "Verifique se as configurações estão corretas de acordo com as especificações do Kubernetes "
+                    "e identifique qualquer problema que possa comprometer a funcionalidade ou coerência com as boas práticas.\n"
+                    "Para cada problema encontrado, sugira uma correção específica.\n"
+                    f"Faça a atualização do serviço e do deployment no namespace {ns}. Se houver conflito, remova e depois aplique.\n\n"
+                    f"YAML VIVO PARA ANÁLISE:\n{live_yaml}"
+                )
+
                 agent = self.get_agent(model)
                 sys_instruction = (
-                    "Você é um Auditor de Segurança K8s. Analise o YAML enviado, "
-                    "identifique falhas e use a ferramenta 'apply_manifest' para corrigir."
+                    "Você é um Auditor de Segurança K8s e Engenheiro de Operações Sênior. "
+                    "Sua análise deve ser rigorosa e focada em resiliência e segurança de produção."
                 )
-                prompt = f"Corrija o recurso no namespace {ns}:\n\n{live_yaml}"
+                
                 full_res = agent.run(prompt, system_instruction=sys_instruction) 
 
-                # 4. Health Check (O veredito real do cluster)
+                # 4. Health Check
                 is_ok, msg = self.health.check_health(ns)
 
-                # 5. Finalização (Escreve no CSV e gera o Markdown)
+                # 5. Finalização
                 self.save_results(model, yaml_file, full_res, is_ok, msg, ns)
 
 #    def save_results(self, model, yaml_file, full_res, is_ok, health_msg, ns):

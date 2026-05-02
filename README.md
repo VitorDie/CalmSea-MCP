@@ -172,6 +172,7 @@ docker logs -f performance-test
 
 # EXECUÇÃO UTILIZANDO APENAS OPENAI
 
+docker compose up -d ollama-cpu servermcp
 docker compose up performancetest
 
 # 2. Coleta de Dados: 

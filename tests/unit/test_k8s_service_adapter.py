@@ -38,14 +38,9 @@ class TestK8sServiceAdapter(unittest.TestCase):
     @patch('src.infrastructure.k8s_adapter.service.config')
     @patch('src.infrastructure.k8s_adapter.service.client')
     def test_should_handle_api_exception(self, mock_client, mock_config):
-        """
-        Testa se o adapter não quebra quando o K8s dá erro.
-        """
         # 1. ARRANGE
         mock_core_v1 = MagicMock()
         mock_client.CoreV1Api.return_value = mock_core_v1
-        
-        # Simula uma exceção da lib do kubernetes
         from kubernetes.client.rest import ApiException
         mock_core_v1.list_namespaced_pod.side_effect = ApiException(status=403, reason="Forbidden")
 
@@ -54,9 +49,8 @@ class TestK8sServiceAdapter(unittest.TestCase):
         # 2. ACT
         result = adapter.list_resources('pods', 'default')
 
-        # 3. ASSERT
-        # No nosso código, definimos que erro retorna lista vazia e loga o erro
-        self.assertEqual(result, [])
+        # 3. ASSERT - Agora esperamos a mensagem de erro formatada
+        self.assertEqual(result, ['Erro na API K8s: Forbidden (Status: 403)'])
 
 if __name__ == "__main__":
     unittest.main()

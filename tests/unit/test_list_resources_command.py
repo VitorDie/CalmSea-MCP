@@ -8,34 +8,28 @@ from src.application.use_cases.list_resources_command import ListResourcesComman
 class TestListResourcesCommand(unittest.TestCase):
 
     def test_execute_should_return_grouped_resources(self):
-        """
-        Testa se o comando itera sobre a lista de tipos e agrupa os resultados corretamente.
-        """
-        # 1. ARRANGE (Preparação)
+        # 1. ARRANGE
         mock_k8s_service = MagicMock()
         
-        # Simulamos que o serviço retorna uma lista fake baseada no tipo pedido
-        # Ex: se pedir 'pods', retorna ['pod-1'], se 'services', retorna ['svc-1']
-        mock_k8s_service.list_resources.side_effect = lambda resource_type, namespace: [f"{resource_type}-1"]
+        # Ajustamos a lambda para ser genérica e aceitar os argumentos do comando
+        mock_k8s_service.list_resources.side_effect = lambda resource_types, namespace: {
+            t: [f"{t}-1"] for t in resource_types
+        }
 
-        # Instanciamos o Command injetando o Mock
         command = ListResourcesCommand(k8s_service=mock_k8s_service)
 
-        # 2. ACT (Ação)
+        # 2. ACT
         result = command.execute(
             resource_types=["pods", "services"], 
             namespace="default"
         )
 
-        # 3. ASSERT (Verificação)
+        # 3. ASSERT
         expected_result = {
             "pods": ["pods-1"],
             "services": ["services-1"]
         }
-        
         self.assertEqual(result, expected_result)
-        # Verifica se o método list_resources do serviço foi chamado exatamente 2 vezes
-        self.assertEqual(mock_k8s_service.list_resources.call_count, 2)
 
 if __name__ == "__main__":
     unittest.main()

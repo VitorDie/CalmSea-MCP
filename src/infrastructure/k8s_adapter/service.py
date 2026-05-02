@@ -12,64 +12,138 @@ logger = logging.getLogger(__name__)
 class K8sServiceAdapter(K8sServiceInterface):
     def __init__(self, kube_config_path=None):
         """
-        Inicializa a conexão com o Cluster.
-        Tenta carregar ~/.kube/config ou config in-cluster (se estiver rodando num pod).
+        Inicializa a conexão soberana com o Cluster.
         """
         try:
             if kube_config_path:
                 config.load_kube_config(config_file=kube_config_path)
             else:
-                # Tenta carregar padrão, fallback para in-cluster se falhar
                 try:
                     config.load_kube_config()
                 except config.ConfigException:
                     config.load_incluster_config()
             
-            # Clientes de API mais usados
+            # APIs essenciais para automação e escalonamento
             self.core_v1 = client.CoreV1Api()
             self.apps_v1 = client.AppsV1Api()
+            self.autoscaling_v2 = client.AutoscalingV2Api() # Suporte vital para HPA
             self.api_client = client.ApiClient()
             
-            logger.info("Conexão com Kubernetes estabelecida com sucesso.")
+            logger.info("Conexão estabelecida. Pronto para operar o cluster.")
         except Exception as e:
-            logger.error(f"Falha ao conectar no Kubernetes: {e}")
+            logger.error(f"Falha na conexão: {e}")
             raise e
 
-    def list_resources(self, resource_type: str, namespace: str) -> List[str]:
-        try:
-            items = []
-            if resource_type == 'pods':
-                result = self.core_v1.list_namespaced_pod(namespace)
-                items = result.items
-            elif resource_type == 'services':
-                result = self.core_v1.list_namespaced_service(namespace)
-                items = result.items
-            elif resource_type == 'deployments':
-                result = self.apps_v1.list_namespaced_deployment(namespace)
-                items = result.items
-            else:
-                return [f"Erro: Tipo '{resource_type}' não suportado nesta versão."]
+    def _strip_metadata(self, data: Any):
+        """
+        Faxina técnica: Remove campos de runtime que impedem a síntese (apply).
+        """
+        forbidden_keys = [
+            'uid', 'resourceVersion', 'creationTimestamp', 
+            'generation', 'managedFields', 'status'
+        ]
+        
+        if isinstance(data, dict):
+            # Limpa o bloco metadata se ele existir
+            metadata = data.get('metadata', {})
+            for key in forbidden_keys:
+                metadata.pop(key, None)
+            
+            # O bloco status nunca deve ser enviado num apply de correção
+            data.pop('status', None)
 
-            return [item.metadata.name for item in items]
+            # Varredura recursiva para capturar metadados em listas ou objetos aninhados
+            for key, value in data.items():
+                self._strip_metadata(value)
+        elif isinstance(data, list):
+            for item in data:
+                self._strip_metadata(item)
+
+    def list_resources(self, resource_types: Any, namespace: str) -> Any:
+        """
+        Lista recursos no cluster. 
+        Suporta string única (modo legado/teste) ou Lista (modo AgentK).
+        """
+        # 1. Normalização do input para evitar iteração sobre letras de uma string
+        if isinstance(resource_types, str):
+            r_types_list = [resource_types]
+            single_mode = True
+        else:
+            r_types_list = resource_types
+            single_mode = False
+
+        results = {}
+        try:
+            for r_type in r_types_list:
+                t = r_type.lower()
+                if t == 'pods':
+                    items = self.core_v1.list_namespaced_pod(namespace).items
+                elif t == 'services':
+                    items = self.core_v1.list_namespaced_service(namespace).items
+                elif t == 'deployments':
+                    items = self.apps_v1.list_namespaced_deployment(namespace).items
+                elif t in ['hpa', 'horizontalpodautoscalers']:
+                    items = self.autoscaling_v2.list_namespaced_horizontal_pod_autoscaler(namespace).items
+                else:
+                    logger.warning(f"Tipo {r_type} não suportado na listagem.")
+                    continue
+                
+                results[r_type] = [item.metadata.name for item in items]
+            
+            # 2. Normalização do output para manter os testes unitários passando
+            if single_mode:
+                # Se foi pedida uma string, retorna apenas a lista de nomes daquele recurso
+                return results.get(r_types_list[0], [])
+            
+            # Se foi pedida uma lista, retorna o dicionário completo {tipo: [nomes]}
+            return results
+
         except ApiException as e:
-            logger.error(f"Erro ao listar {resource_type}: {e}")
-            return []
+            logger.error(f"Erro na listagem de recursos: {e}")
+            # RETORNE O ERRO, não uma lista vazia!
+            error_msg = f"Erro na API K8s: {e.reason} (Status: {e.status})"
+            return [error_msg] if single_mode else {"error": error_msg} 
 
     def get_resource_details(self, resource_type: str, name: str, namespace: str) -> Dict[str, Any]:
         try:
-            # Transforma o objeto do K8s em dicionário puro para o LLM ler
-            if resource_type == 'pods':
-                resource = self.core_v1.read_namespaced_pod(name, namespace)
-            elif resource_type == 'services':
-                resource = self.core_v1.read_namespaced_service(name, namespace)
-            elif resource_type == 'deployments':
-                resource = self.apps_v1.read_namespaced_deployment(name, namespace)
-            else:
-                return {"error": "Resource type not supported"}
+            t = resource_type.lower().strip()
             
-            return self.api_client.sanitize_for_serialization(resource)
+            # Mapeamento Flexível (Singular e Plural)
+            if t in ['pod', 'pods']:
+                res = self.core_v1.read_namespaced_pod(name, namespace)
+            elif t in ['service', 'services', 'svc']:
+                res = self.core_v1.read_namespaced_service(name, namespace)
+            elif t in ['deployment', 'deployments', 'deploy']:
+                res = self.apps_v1.read_namespaced_deployment(name, namespace)
+            elif t in ['hpa', 'horizontalpodautoscalers']:
+                res = self.autoscaling_v2.read_namespaced_horizontal_pod_autoscaler(name, namespace)
+            else:
+                return {"error": f"Tipo '{resource_type}' não suportado para leitura de detalhes."}
+            
+            # 1. Sanitização inicial
+            raw_res = self.api_client.sanitize_for_serialization(res)
+            
+            # 2. A FAXINA: Removendo o ruído para o Agente focar na síntese
+            # Removemos o 'status', que é informação de runtime e não serve para o manifest
+            raw_res.pop('status', None)
+            
+            if 'metadata' in raw_res:
+                # Campos que o K8s gera e que confundem a IA no 'apply'
+                keys_to_purge = [
+                    'managedFields', 
+                    'resourceVersion', 
+                    'uid', 
+                    'creationTimestamp', 
+                    'generation',
+                    'selfLink'
+                ]
+                for key in keys_to_purge:
+                    raw_res['metadata'].pop(key, None)
+                    
+            return raw_res
+
         except ApiException as e:
-            return {"error": str(e), "status": e.status}
+            return {"error": f"Recurso não encontrado: {name}", "status": e.status}
 
     def get_pod_logs(self, pod_name: str, namespace: str, tail_lines: int) -> str:
         try:
@@ -89,45 +163,57 @@ class K8sServiceAdapter(K8sServiceInterface):
             logger.error(f"Erro ao listar namespaces: {e}")
             return []
 
-    def apply_manifest(self, manifest, namespace: str = "default") -> dict:
+    def apply_manifest(self, manifest: Any, namespace: str = "default") -> dict:
+        """
+        Executa a aplicação do manifesto com limpeza prévia de metadados.
+        """
         try:
-            # 1. Garante que o manifesto seja uma string no formato YAML
-            if isinstance(manifest, dict):
-                manifest_str = yaml.dump(manifest)
-            elif isinstance(manifest, list):
-                manifest_str = yaml.dump_all(manifest)
+            # 1. Normalização do input
+            if isinstance(manifest, str):
+                data = yaml.safe_load(manifest)
             else:
-                manifest_str = str(manifest)
+                data = manifest
 
-            # 2. Executa o comando kubectl nativo injetando o YAML via stdin
+            # 2. Limpeza Recursiva (A chave para o sucesso do apply)
+            self._strip_metadata(data)
+            
+            # 3. Conversão para string limpa
+            clean_yaml = yaml.dump(data)
+
+            # 4. Execução via kubectl para máxima compatibilidade com CRDs e Hooks
             process = subprocess.run(
                 ["kubectl", "apply", "-f", "-", "-n", namespace],
-                input=manifest_str,
+                input=clean_yaml,
                 text=True,
                 capture_output=True,
                 check=True
             )
             
-            return {"status": "success", "message": f"Sucesso:\n{process.stdout}"}
+            return {"status": "SUCCESS", "message": process.stdout}
             
         except subprocess.CalledProcessError as e:
-            return {"status": "error", "message": f"Erro do K8s: {e.stderr}"}
+            logger.error(f"Erro no apply: {e.stderr}")
+            return {"status": "ERROR", "message": e.stderr}
         except Exception as ex:
-            return {"status": "error", "message": str(ex)}
+            return {"status": "ERROR", "message": str(ex)}
 
-    def delete_resource(self, resource_type: str, name: str, namespace: str) -> Any:
+    def delete_resource(self, resource_type: str, name: str, namespace: str) -> Dict[str, str]:
         try:
-            if resource_type == 'pods':
+            t = resource_type.lower().strip()
+            if t in ['pod', 'pods']:
                 self.core_v1.delete_namespaced_pod(name, namespace)
-            elif resource_type == 'services':
+            elif t in ['service', 'services', 'svc']:
                 self.core_v1.delete_namespaced_service(name, namespace)
-            elif resource_type == 'deployments':
+            elif t in ['deployment', 'deployments', 'deploy']:
                 self.apps_v1.delete_namespaced_deployment(name, namespace)
+            elif t in ['hpa', 'horizontalpodautoscalers']:
+                self.autoscaling_v2.delete_namespaced_horizontal_pod_autoscaler(name, namespace)
             else:
-                return {"status": "error", "message": "Type not supported"}
-            return {"status": "success", "message": f"{resource_type}/{name} deleted"}
+                return {"status": "error", "message": f"Tipo '{resource_type}' não suportado para deleção."}
+            
+            return {"status": "success", "message": f"{resource_type} {name} deletado com sucesso."}
         except ApiException as e:
-             return {"status": "error", "message": str(e)}
+            return {"status": "error", "message": f"Falha ao deletar: {e.reason}"}
 
     def scale_resource(self, resource_type: str, name: str, namespace: str, replicas: int) -> Any:
         try:

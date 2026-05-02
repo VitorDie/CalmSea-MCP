@@ -98,18 +98,24 @@ TOOLS_SCHEMA = [
         }
     },
     {
-        "type": "function",
-        "function": {
-            "name": "apply_manifest",
-            "description": "Aplica um manifesto Kubernetes (YAML/JSON) diretamente.",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "manifest": {"type": "object", "description": "O dicionário representando o manifesto YAML/JSON."},
-                    "namespace": {"type": "string", "description": "Namespace alvo."}
-                },
-                "required": ["manifest", "namespace"]
+            "type": "function",
+            "function": {
+                "name": "apply_manifest",
+                "description": "Aplica um manifesto Kubernetes (YAML/JSON) diretamente no cluster. Suporta múltiplos recursos em uma única string separados por '---'.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "manifest": {
+                            "type": "string", 
+                            "description": "O conteúdo YAML completo, limpo e corrigido do(s) recurso(s). Deve ser uma string formatada como YAML."
+                        },
+                        "namespace": {
+                            "type": "string", 
+                            "description": "Namespace alvo onde o recurso será aplicado."
+                        }
+                    },
+                    "required": ["manifest", "namespace"]
+                }
             }
-        }
     }
 ]

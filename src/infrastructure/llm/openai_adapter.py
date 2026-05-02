@@ -12,7 +12,6 @@ class OpenAIAdapter(LLMProviderInterface):
         
         self.client = OpenAI(api_key=self.api_key)
         self.model = model
-        # Inicializa para evitar erro no Decorator antes da 1ª chamada
         self.last_full_response = {} 
 
     def generate_text(self, prompt: str, system_instruction: str = None) -> str:
@@ -21,61 +20,46 @@ class OpenAIAdapter(LLMProviderInterface):
             messages.append({"role": "system", "content": system_instruction})
         messages.append({"role": "user", "content": prompt})
 
-        # Monta os argumentos base
-        kwargs = {
-            "model": self.model,
-            "messages": messages,
-        }
-        
-        # Só adiciona temperature se o modelo NÃO for da família "o"
+        kwargs = {"model": self.model, "messages": messages}
         if not self.model.startswith("o"):
             kwargs["temperature"] = 0.7
 
         try:
             response = self.client.chat.completions.create(**kwargs)
-            # SALVA PARA O DECORATOR
             self.last_full_response = response 
             return response.choices[0].message.content
         except OpenAIError as e:
-            self.last_full_response = {} # Limpa para o decorator não ler lixo
-            return f"Erro na OpenAI: {str(e)}"
+            return f"Erro OpenAI: {str(e)}"
 
-    def decide_tool(self, prompt: str, tools_schema: List[Dict[str, Any]], system_instruction: str = None) -> Dict[str, Any]:
-        messages = []
+    def decide_tool(self, messages: List[Dict[str, str]], tools_schema: List[Dict[str, Any]], system_instruction: str = None) -> Dict[str, Any]:
+        # Constrói o payload de mensagens corretamente
+        api_messages = []
         if system_instruction:
-            messages.append({"role": "system", "content": system_instruction})
-        messages.append({"role": "user", "content": prompt})
+            api_messages.append({"role": "system", "content": system_instruction})
+        
+        # Adiciona o histórico que já vem formatado
+        api_messages.extend(messages)
 
-        # Monta os argumentos base
         kwargs = {
             "model": self.model,
-            "messages": messages,
+            "messages": api_messages,
             "tools": tools_schema,
-            "tool_choice": "auto"
+            "tool_choice": "auto",
+            "temperature": 0.0 # Determinismo total
         }
-        
-        # Só adiciona temperature se o modelo NÃO for da família "o"
-        if not self.model.startswith("o"):
-            kwargs["temperature"] = 0.0
 
         try:
             response = self.client.chat.completions.create(**kwargs)
-            # SALVA PARA O DECORATOR (Métricas também em chamadas de ferramentas!)
             self.last_full_response = response 
-
             message = response.choices[0].message
-            tool_calls = message.tool_calls
-
-            if tool_calls:
-                selected_tool = tool_calls[0]
+            
+            if message.tool_calls:
+                selected_tool = message.tool_calls[0]
                 return {
                     "action": "tool_use",
                     "tool_name": selected_tool.function.name,
                     "tool_args": json.loads(selected_tool.function.arguments)
                 }
-
             return {"action": "reply", "content": message.content}
-
-        except OpenAIError as e:
-            self.last_full_response = {} # Limpa para o decorator não ler lixo
+        except Exception as e:
             return {"action": "error", "content": str(e)}

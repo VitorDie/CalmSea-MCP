@@ -18,7 +18,7 @@ class PerformanceTestRunner:
             "5-nginx.yaml", "6-selenium.yaml", "7-elasticsearch.yaml", 
             "8-newrelic.yaml", "9-storm.yaml", "10-mongodb.yaml", "fiware-minikube.yaml"
         ]
-        self.reps = 1
+        self.reps = 5
         self.collector = TCCMetricsCollector()
         self.env_mgr = K8sScenarioManager()
         self.health = K8sHealthChecker()

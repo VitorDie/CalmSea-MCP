@@ -25,9 +25,16 @@ def get_openai_models(api_key):
 
 def get_ollama_models():
     try:
-        return [m['name'] for m in ollama.list()['models']]
-    except:
-        return ["llama3.1:latest"]
+        response = ollama.list()
+        # Na v0.1.0+, response é um objeto ListResponse com atributo 'models'
+        if hasattr(response, 'models'):
+            return [m.model for m in response.models]
+        # Fallback para versões legadas/dicionário
+        return [m['name'] for m in response.get('models', [])]
+    except Exception as e:
+        # Debug útil para o console do Streamlit
+        print(f"[DEBUG] Erro ao listar Ollama: {e}")
+        return [""]
 
 with st.sidebar:
     st.title("⚙️ Configuração")

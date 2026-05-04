@@ -6,6 +6,7 @@ services:
     container_name: agentk-tests-unit
     environment:
       - PYTHONPATH=/app
+      - OLLAMA_HOST=127.0.0.1:11434 # Garante o bind no host network
     volumes:
       - ./src:/app/src
       - ./tests:/app/tests
@@ -140,6 +141,7 @@ services:
       - PYTHONPATH=/app
       - OPENAI_API_KEY=${OPENAI_API_KEY}
       - KUBECONFIG=/app/remote-kubeconfig.yaml 
+      - OLLAMA_HOST=127.0.0.1:11434  # <--- Vital para o Collector/Decorator
     volumes:
       - ./src:/app/src
       - ./docs/tests:/app/docs/tests

@@ -3,6 +3,8 @@ import os
 import sys
 import ollama
 from openai import OpenAI
+from datetime import datetime
+from src.application.services.report_exporter import ReportExporter
 
 # Caminhos do projeto
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "../../../")))
@@ -67,6 +69,37 @@ if prompt := st.chat_input("Comando de SRE..."):
 
     with st.chat_message("assistant"):
         with st.spinner("Processando..."):
+            # 1. O Agente executa a ação
             response = agent.run(prompt)
             st.markdown(response)
             st.session_state.messages.append({"role": "assistant", "content": response})
+
+            # 2. "Faxina" Pós-Resposta: Captura o estado real do cluster para o relatório
+            # Usamos o seu k8s adapter para pegar o snapshot (get all)
+            # Dica: você pode tentar extrair o namespace do prompt ou usar um padrão
+            target_ns = "default" 
+            try:
+                # Aqui usamos o comando que você já usa no persist_results
+                verify_output = os.popen(f"kubectl get all -n {target_ns}").read()
+            except:
+                verify_output = "Não foi possível capturar o estado do cluster."
+
+            # 3. Gera o Markdown usando a Classe Unificada
+            md_report = ReportExporter.generate_markdown(
+                model=model,
+                res=response,
+                is_ok=True, # No manual, o usuário decide, mas marcamos como True para o template
+                health_msg="Interação via Dashboard (Manual)",
+                ns=target_ns,
+                verify_output=verify_output,
+                yaml_name="Chat_Interativo"
+            )
+
+            # 4. O Botão de Exportação
+            st.download_button(
+                label="📥 Baixar Relatório de SRE (.md)",
+                data=md_report,
+                file_name=f"Relatorio_AgentK_{datetime.now().strftime('%H%M%S')}.md",
+                mime="text/markdown",
+                help="Clique para baixar o diagnóstico formatado para o TCC."
+            )

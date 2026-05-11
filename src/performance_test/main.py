@@ -13,6 +13,7 @@ from src.infrastructure.k8s_adapter.service import K8sServiceAdapter
 from src.infrastructure.metrics.collector import TCCMetricsCollector
 from src.infrastructure.k8s_adapter.scenario_manager import K8sScenarioManager
 from src.infrastructure.k8s_adapter.health_checker import K8sHealthChecker
+from src.application.services.report_exporter import ReportExporter
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger("BenchmarkRunner")
@@ -110,26 +111,17 @@ class PerformanceTestRunner:
         """Salva métricas no CSV e gera o relatório qualitativo (MD)."""
         # Envia para o TCCMetricsCollector para gerar a linha no CSV
         self.collector.commit(is_ok, health_msg)
-        
-        output_dir = f"results/{model.replace(':', '-')}"
-        os.makedirs(output_dir, exist_ok=True)
-        
-        # Coleta o estado final para auditoria do TCC
+    
+        # Coleta o estado para o relatório
         verify_output = os.popen(f"kubectl get all -n {ns}").read()
-        
-        status_icon = "✅" if is_ok else "❌"
-        timestamp = datetime.now().strftime('%H%M%S')
-        fname = f"{output_dir}/Teste_{yaml.split('-')[0]}.{r}_{timestamp}.md"
-        
-        with open(fname, "w") as f:
-            f.write(f"# Relatório de Benchmark: {yaml}\n\n")
-            f.write(f"* **Modelo:** `{model}`\n")
-            f.write(f"* **Rodada:** {r}\n")
-            f.write(f"* **Status Final:** {status_icon} {'SUCESSO' if is_ok else 'FALHA'}\n")
-            f.write(f"* **HealthCheck:** {health_msg}\n\n")
-            f.write(f"## 🧠 Raciocínio do Agente\n{res}\n\n")
-            f.write(f"## 📋 Estado Final do Namespace ({ns})\n```\n{verify_output}```")
-        
+    
+        # Usa a nova classe para gerar o MD
+        md_content = ReportExporter.generate_markdown(
+            model, res, is_ok, health_msg, ns, verify_output, yaml, r
+        )
+    
+        # Salva no disco como antes
+        fname = ReportExporter.save_to_disk(model, yaml, r, md_content)
         logger.info(f"💾 Resultados persistidos em: {fname}")
 
 if __name__ == "__main__":

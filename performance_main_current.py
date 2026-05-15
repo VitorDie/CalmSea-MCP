@@ -1,4 +1,3 @@
-import csv
 import os
 import time
 import logging
@@ -23,12 +22,23 @@ class PerformanceTestRunner:
     """
     Executor dos testes de performance do AgentK.
 
-    Melhorias desta versão:
-    - passa HealthChecker e namespace ao AgentService;
-    - permite early-stop logo após apply_manifest quando o ambiente estabiliza;
-    - mantém coleta de diagnóstico estruturado apenas quando o HealthCheck final falha;
-    - registra estatísticas operacionais do agente no relatório;
-    - tenta preencher Tokens Consumidos no Markdown a partir do CSV de métricas.
+    Configuração por variáveis de ambiente:
+
+    PERFORMANCE_TEST_MODELS
+        Lista de modelos separados por vírgula.
+        Padrão: qwen2.5:3b
+
+    PERFORMANCE_TEST_YAMLS
+        Lista de cenários YAML separados por vírgula.
+        Padrão: os 10 cenários de docs/tests/scenarios.
+
+    PERFORMANCE_TEST_REPS
+        Número de repetições por cenário.
+        Padrão: 1 para execução local rápida.
+
+    PERFORMANCE_TEST_SLEEP_SECONDS
+        Pausa entre rodadas.
+        Padrão: 5 segundos.
     """
 
     DEFAULT_MODELS = ["qwen2.5:3b"]
@@ -69,12 +79,6 @@ class PerformanceTestRunner:
             minimum=0,
         )
 
-        self.early_healthcheck_timeout = self._get_int_env(
-            name="AGENTK_EARLY_HEALTHCHECK_TIMEOUT",
-            default=25,
-            minimum=5,
-        )
-
         self.collector = TCCMetricsCollector()
         self.env_mgr = K8sScenarioManager()
         self.health = K8sHealthChecker()
@@ -97,7 +101,6 @@ class PerformanceTestRunner:
         logger.info("Cenários: %s", self.yamls)
         logger.info("Repetições por cenário: %s", self.reps)
         logger.info("Pausa entre rodadas: %s segundo(s)", self.sleep_seconds)
-        logger.info("Early HealthCheck timeout: %s segundo(s)", self.early_healthcheck_timeout)
 
     def _get_csv_env(self, name: str, default: List[str]) -> List[str]:
         raw_value = os.getenv(name, "").strip()
@@ -141,7 +144,7 @@ class PerformanceTestRunner:
 
         return value
 
-    def _get_agent(self, model_name: str, namespace: str) -> AgentService:
+    def _get_agent(self, model_name: str) -> AgentService:
         """Instancia um agente novo com monitoramento de tokens/latência."""
         k8s = K8sServiceAdapter()
 
@@ -153,14 +156,7 @@ class PerformanceTestRunner:
             provider = "Ollama"
 
         monitored_llm = LLMMonitorDecorator(adapter, provider, self.collector)
-
-        return AgentService(
-            llm_provider=monitored_llm,
-            k8s_adapter=k8s,
-            health_checker=self.health,
-            target_namespace=namespace,
-            early_healthcheck_timeout=self.early_healthcheck_timeout,
-        )
+        return AgentService(llm_provider=monitored_llm, k8s_adapter=k8s)
 
     def run(self):
         logger.info("🎬 Iniciando campanha de benchmark AgentK-MCP")
@@ -182,7 +178,7 @@ class PerformanceTestRunner:
                         header = self.scenario_headers.get(yaml_file, f"Arquivo: {yaml_file}")
                         prompt = self._build_prompt(header, ns)
 
-                        agent = self._get_agent(model_name=model, namespace=ns)
+                        agent = self._get_agent(model)
                         full_res = agent.run(prompt)
 
                         is_ok, msg = self.health.check_health(ns)
@@ -195,8 +191,6 @@ class PerformanceTestRunner:
                                 namespace=ns,
                             )
 
-                        agent_stats = agent.get_run_stats()
-
                         self._persist_results(
                             model=model,
                             yaml_name=yaml_file,
@@ -206,7 +200,6 @@ class PerformanceTestRunner:
                             health_msg=msg,
                             namespace=ns,
                             pod_diagnostics=pod_diagnostics,
-                            agent_stats=agent_stats,
                         )
 
                         time.sleep(self.sleep_seconds)
@@ -224,19 +217,16 @@ class PerformanceTestRunner:
     def _build_prompt(self, header: str, ns: str) -> str:
         return (
             f"{header}\n\n"
-            f"Analise os recursos Kubernetes acima no namespace '{ns}', procurando por misconfigurations "
-            f"e incoerências que impeçam estabilidade em ambiente de produção.\n"
-            f"Use as ferramentas disponíveis para extrair o estado real do cluster.\n\n"
-            f"Estratégia obrigatória:\n"
-            f"1. Liste recursos primeiro.\n"
-            f"2. Busque detalhes somente dos recursos suspeitos.\n"
-            f"3. Use get_pod_diagnostics para pods Pending, ContainerCreating, FailedMount, ImagePullBackOff, "
-            f"ErrImagePull, CrashLoopBackOff, Error ou CreateContainerConfigError.\n"
-            f"4. Aplique correções em um único YAML multi-documento quando houver mais de um recurso.\n"
-            f"5. Não reaplique manifesto igual.\n"
-            f"6. Se apply_manifest for bem-sucedido e o HealthCheck confirmar estabilidade, finalize.\n\n"
-            f"Faça a atualização necessária no namespace '{ns}'. Se houver conflito real, remova apenas o recurso conflitante "
-            f"e aplique o manifesto corrigido.\n"
+            f"Analise os arquivos YAML dos recursos Kubernetes acima no namespace '{ns}', procurando por misconfigurations "
+            f"e possíveis incoerências, considerando o deploy em ambiente de produção.\n"
+            f"Utilize as ferramentas disponíveis para extrair o estado atual dos recursos.\n"
+            f"Verifique se as configurações estão corretas de acordo com as especificações do Kubernetes e identifique qualquer "
+            f"problema que possa comprometer a funcionalidade ou coerência com as boas práticas.\n"
+            f"Para cada problema encontrado, sugira uma correção específica.\n\n"
+            f"Faça a atualização do serviço e do deployment no namespace '{ns}'. Se houver conflito, remova e depois aplique.\n"
+            f"Use a estratégia mais eficiente: liste recursos primeiro, busque detalhes somente dos recursos necessários, "
+            f"use get_pod_diagnostics para pods Pending, ContainerCreating, FailedMount, ImagePullBackOff, ErrImagePull "
+            f"ou CrashLoopBackOff, e aplique manifestos multi-documento em uma única chamada quando houver mais de um recurso.\n\n"
         )
 
     def _collect_failure_diagnostics(
@@ -248,8 +238,8 @@ class PerformanceTestRunner:
         Coleta diagnóstico estruturado dos pods quando o HealthCheck falha.
 
         Isso melhora o relatório do benchmark e evita que a falha fique limitada a:
-        - timeout genérico;
-        - mensagem curta do health check;
+        - Timeout genérico;
+        - Mensagem curta do health check;
         - kubectl get all sem causa raiz.
         """
         diagnostics: List[Dict[str, Any]] = []
@@ -305,29 +295,20 @@ class PerformanceTestRunner:
         health_msg: str,
         namespace: str,
         pod_diagnostics: List[Dict[str, Any]] | None = None,
-        agent_stats: Dict[str, Any] | None = None,
     ) -> None:
         self.collector.commit(is_ok, health_msg)
 
-        tokens = self._read_latest_tokens_from_metrics_csv(model=model)
-
         verify_output = os.popen(f"kubectl get all -n {namespace}").read()
-
-        enriched_response = self._append_agent_stats(
-            response=response,
-            agent_stats=agent_stats or {},
-        )
 
         md_content = ReportExporter.generate_markdown(
             model=model,
-            res=enriched_response,
+            res=response,
             is_ok=is_ok,
             health_msg=health_msg,
             ns=namespace,
             verify_output=verify_output,
             yaml_name=yaml_name,
             round_num=round_number,
-            tokens=tokens,
             pod_diagnostics=pod_diagnostics or [],
         )
 
@@ -339,68 +320,6 @@ class PerformanceTestRunner:
         )
 
         logger.info("💾 Resultados persistidos em: %s", fname)
-
-    def _append_agent_stats(
-        self,
-        response: str,
-        agent_stats: Dict[str, Any],
-    ) -> str:
-        if not agent_stats:
-            return response
-
-        executed_tools = agent_stats.get("executed_tool_names", [])
-        last_health = agent_stats.get("last_health_after_apply")
-
-        lines = [
-            response,
-            "",
-            "## ⚙️ Resumo Operacional do AgentK",
-            "",
-            f"- Iterações executadas: `{agent_stats.get('iterations', 'N/A')}`",
-            f"- Ferramentas executadas: `{', '.join(executed_tools) if executed_tools else 'N/A'}`",
-            f"- Último apply_manifest com sucesso: `{agent_stats.get('last_apply_success')}`",
-        ]
-
-        if last_health:
-            lines.append(f"- HealthCheck pós-apply: `{last_health}`")
-
-        return "\n".join(lines)
-
-    def _read_latest_tokens_from_metrics_csv(self, model: str) -> int:
-        """
-        Lê o último total_tokens registrado no CSV após collector.commit().
-
-        Mantém fallback seguro para 0 caso o formato do collector mude.
-        """
-        candidate_paths = [
-            "results/benchmark_master.csv",
-            "results/benchmark_openai_master.csv",
-            "results/benchmark_qwen30b_master.csv",
-        ]
-
-        for path in candidate_paths:
-            if not os.path.exists(path):
-                continue
-
-            try:
-                with open(path, "r", encoding="utf-8", newline="") as file:
-                    rows = list(csv.DictReader(file))
-
-                for row in reversed(rows):
-                    if row.get("model") != model:
-                        continue
-
-                    raw_tokens = row.get("total_tokens", "0")
-
-                    try:
-                        return int(float(raw_tokens))
-                    except (TypeError, ValueError):
-                        return 0
-
-            except Exception:
-                continue
-
-        return 0
 
 
 if __name__ == "__main__":

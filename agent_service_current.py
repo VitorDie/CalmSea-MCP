@@ -542,15 +542,9 @@ class AgentService:
         elif tool_name == "get_resource_details":
             obs_signature = self._hash_payload(result)
             pod_fastpath_msg = self._build_pod_detail_fastpath_message(result)
-            workload_fastpath_msg = self._build_workload_detail_fastpath_message(result)
-            newrelic_fastpath_msg = self._build_newrelic_detail_fastpath_message(result)
 
             if pod_fastpath_msg:
                 msg = pod_fastpath_msg
-            elif workload_fastpath_msg:
-                msg = workload_fastpath_msg
-            elif newrelic_fastpath_msg:
-                msg = newrelic_fastpath_msg
             elif obs_signature == self._last_obs_hash:
                 msg = (
                     "SISTEMA: Estagnação detectada. O estado observado não mudou. "
@@ -826,454 +820,6 @@ class AgentService:
             "compatível com Minikube. Para benchmark local, use emptyDir se não houver PVC/PV válido."
         )
 
-
-
-    def _build_workload_detail_fastpath_message(self, result: Any) -> str:
-        """
-        Gera orientação determinística para workloads Kubernetes com padrões
-        problemáticos conhecidos.
-
-        Caso real: 7-elasticsearch.yaml.
-        """
-        if not isinstance(result, dict):
-            return ""
-
-        kind = str(result.get("kind", "") or "")
-        kind_lower = kind.lower()
-
-        if kind_lower not in {"replicationcontroller", "deployment", "replicaset", "statefulset"}:
-            return ""
-
-        metadata = result.get("metadata", {}) or {}
-        spec = result.get("spec", {}) or {}
-
-        name = metadata.get("name") or "<nome>"
-        namespace = metadata.get("namespace") or self.target_namespace or "<namespace>"
-
-        serialized = self._safe_json_dumps(result).lower()
-
-        is_elasticsearch = (
-            name == "es"
-            or "elasticsearch" in serialized
-            or "docker.elastic.co/elasticsearch" in serialized
-            or "quay.io/pires/docker-elasticsearch-kubernetes" in serialized
-        )
-
-        if not is_elasticsearch:
-            return ""
-
-        has_pires_image = "quay.io/pires/docker-elasticsearch-kubernetes" in serialized
-        has_latest_or_untagged = (
-            "quay.io/pires/docker-elasticsearch-kubernetes:latest" in serialized
-            or '"image": "quay.io/pires/docker-elasticsearch-kubernetes"' in serialized
-            or "'image': 'quay.io/pires/docker-elasticsearch-kubernetes'" in serialized
-        )
-        has_init_sysctl = "init-sysctl" in serialized or "vm.max_map_count" in serialized
-        missing_single_node = "discovery.type" not in serialized
-        missing_java_opts = "es_java_opts" not in serialized
-
-        if not (has_pires_image or has_latest_or_untagged or has_init_sysctl or missing_single_node or missing_java_opts):
-            return ""
-
-        return (
-            "SISTEMA: get_resource_details identificou workload Elasticsearch com padrão instável para Minikube. "
-            f"Recurso: {kind}/{name} no namespace {namespace}. "
-            "Problemas prováveis: imagem quay.io/pires/docker-elasticsearch-kubernetes sem tag válida ou com latest, "
-            "initContainer init-sysctl/vm.max_map_count sujeito a falha, ausência de discovery.type=single-node "
-            "e ausência de ES_JAVA_OPTS. "
-            "Não continue reaplicando variações do mesmo ReplicationController. "
-            "Próxima ação eficiente: remover o ReplicationController antigo e aplicar manifesto determinístico "
-            "com Service + Deployment apps/v1, imagem docker.elastic.co/elasticsearch/elasticsearch:7.17.11, "
-            "discovery.type=single-node, xpack.security.enabled=false, ES_JAVA_OPTS=-Xms128m -Xmx128m, "
-            "emptyDir e sem init-sysctl."
-        )
-
-    def _should_force_elasticsearch_benchmark_manifest(self, manifest: Any) -> bool:
-        """
-        Bloqueia/substitui automaticamente manifestos Elasticsearch que repetem
-        padrões conhecidos de falha no benchmark local.
-
-        O objetivo é evitar loops caros como:
-        - ReplicationController/es reaplicado várias vezes;
-        - quay.io/pires/docker-elasticsearch-kubernetes sem tag/latest;
-        - init-sysctl com vm.max_map_count;
-        - ausência de discovery.type=single-node e ES_JAVA_OPTS.
-        """
-        text = str(manifest or "")
-        lower = text.lower()
-
-        if "elasticsearch" not in lower and "name: es" not in lower:
-            return False
-
-        if "replicationcontroller" not in lower and "kind: deployment" not in lower:
-            return False
-
-        bad_markers = [
-            "quay.io/pires/docker-elasticsearch-kubernetes",
-            "init-sysctl",
-            "vm.max_map_count",
-            "hostpid: true",
-        ]
-
-        missing_required_runtime = (
-            "discovery.type" not in lower
-            or "single-node" not in lower
-            or "es_java_opts" not in lower
-            or "xpack.security.enabled" not in lower
-        )
-
-        return any(marker in lower for marker in bad_markers) or missing_required_runtime
-
-    def _build_elasticsearch_benchmark_manifest(self, namespace: str) -> str:
-        """
-        Manifesto determinístico e leve para benchmark local em Minikube.
-
-        Decisões:
-        - troca ReplicationController por Deployment apps/v1;
-        - remove init-sysctl e vm.max_map_count;
-        - usa Elasticsearch oficial com tag explícita;
-        - ativa single-node;
-        - desativa xpack security;
-        - limita heap para reduzir risco de OOMKilled;
-        - usa emptyDir para benchmark.
-        """
-        namespace = self._resolve_namespace(namespace)
-
-        return f"""apiVersion: v1
-kind: Service
-metadata:
-  name: elasticsearch
-  namespace: {namespace}
-  labels:
-    component: elasticsearch
-spec:
-  type: ClusterIP
-  selector:
-    component: elasticsearch
-  ports:
-    - name: http
-      port: 9200
-      targetPort: 9200
-      protocol: TCP
-    - name: transport
-      port: 9300
-      targetPort: 9300
-      protocol: TCP
----
-apiVersion: apps/v1
-kind: Deployment
-metadata:
-  name: es
-  namespace: {namespace}
-  labels:
-    component: elasticsearch
-spec:
-  replicas: 1
-  selector:
-    matchLabels:
-      component: elasticsearch
-  template:
-    metadata:
-      labels:
-        component: elasticsearch
-    spec:
-      securityContext:
-        fsGroup: 1000
-      containers:
-        - name: es
-          image: docker.elastic.co/elasticsearch/elasticsearch:7.17.11
-          imagePullPolicy: IfNotPresent
-          ports:
-            - name: http
-              containerPort: 9200
-              protocol: TCP
-            - name: transport
-              containerPort: 9300
-              protocol: TCP
-          env:
-            - name: discovery.type
-              value: single-node
-            - name: xpack.security.enabled
-              value: "false"
-            - name: ES_JAVA_OPTS
-              value: "-Xms128m -Xmx128m"
-            - name: cluster.name
-              value: agentk-es
-            - name: network.host
-              value: "0.0.0.0"
-          resources:
-            requests:
-              cpu: 100m
-              memory: 384Mi
-            limits:
-              cpu: 1000m
-              memory: 768Mi
-          volumeMounts:
-            - name: storage
-              mountPath: /usr/share/elasticsearch/data
-          readinessProbe:
-            tcpSocket:
-              port: 9200
-            initialDelaySeconds: 40
-            periodSeconds: 10
-            timeoutSeconds: 5
-            failureThreshold: 12
-      volumes:
-        - name: storage
-          emptyDir: {{}}
-"""
-
-
-    def _build_newrelic_detail_fastpath_message(self, result: Any) -> str:
-        """
-        Fastpath determinístico para o cenário 8-newrelic.yaml.
-
-        Caso real:
-        - DaemonSet/newrelic-agent referencia Secret/newrelic-config;
-        - Secret não existe;
-        - pod fica em ContainerCreating por FailedMount;
-        - o agente não deve responder pedindo preenchimento manual com placeholders;
-        - para benchmark local, basta criar um Secret mínimo sem valores sensíveis reais.
-        """
-        if not isinstance(result, dict):
-            return ""
-
-        kind = str(result.get("kind", "") or "").lower()
-
-        if kind != "daemonset":
-            return ""
-
-        metadata = result.get("metadata", {}) or {}
-        spec = result.get("spec", {}) or {}
-
-        name = metadata.get("name") or ""
-        namespace = metadata.get("namespace") or self.target_namespace or "default"
-
-        serialized = self._safe_json_dumps(result).lower()
-
-        is_newrelic = (
-            name == "newrelic-agent"
-            or "newrelic" in serialized
-            or "new_relic_license_key" in serialized
-            or "newrelic-config" in serialized
-        )
-
-        if not is_newrelic:
-            return ""
-
-        references_missing_secret_candidate = "newrelic-config" in serialized
-
-        if not references_missing_secret_candidate:
-            return ""
-
-        secret_manifest = self._build_newrelic_benchmark_secret_manifest(namespace)
-
-        return (
-            "SISTEMA: get_resource_details identificou DaemonSet NewRelic que referencia "
-            "Secret/newrelic-config. Se o Secret estiver ausente, o pod ficará em ContainerCreating "
-            "com FailedMount. Para este benchmark local, não responda pedindo que o usuário preencha "
-            "placeholders ou valores reais. Próxima ação eficiente: chame apply_manifest agora com "
-            "um Secret mínimo, sem placeholders, para satisfazer o volume obrigatório. "
-            "Manifesto recomendado:\n"
-            f"{secret_manifest}"
-        )
-
-    def _build_newrelic_benchmark_secret_manifest(self, namespace: str) -> str:
-        """
-        Secret mínimo para estabilizar o cenário 8-newrelic.yaml em benchmark local.
-
-        Não usa placeholders como <BASE64...> e não usa credenciais reais.
-        O objetivo é permitir o mount do volume newrelic-config; o container do cenário
-        já executa um loop de longa duração e não depende de conexão real com New Relic.
-        """
-        namespace = self._resolve_namespace(namespace)
-
-        return f"""apiVersion: v1
-kind: Secret
-metadata:
-  name: newrelic-config
-  namespace: {namespace}
-type: Opaque
-stringData:
-  newrelic-infra.yml: |
-    license_key: agentk-benchmark-license-key
-    display_name: agentk-minikube
-  NEW_RELIC_LICENSE_KEY: agentk-benchmark-license-key
-  API_SECRET: agentk-benchmark-api-token
-"""
-
-    def _validate_newrelic_manual_secret_reply(self, reply_content: str) -> str:
-        """
-        Bloqueia resposta final que apenas orienta criação manual do Secret NewRelic
-        com placeholders, sem executar apply_manifest.
-        """
-        content = str(reply_content or "")
-        lower = content.lower()
-
-        if "newrelic-config" not in lower:
-            return ""
-
-        if self._last_apply_success:
-            return ""
-
-        manual_markers = [
-            "preencha",
-            "substitua",
-            "<base64",
-            "base64_da",
-            "base64_do",
-            "você deve fornecer",
-            "voce deve fornecer",
-            "kubectl apply -f",
-            "criar o secret",
-            "crie o secret",
-        ]
-
-        if not any(marker in lower for marker in manual_markers):
-            return ""
-
-        manifest = self._build_newrelic_benchmark_secret_manifest(self.target_namespace or "default")
-
-        return (
-            "[SISTEMA]: A resposta final foi bloqueada porque apenas orienta criação manual "
-            "do Secret/newrelic-config, possivelmente com placeholders, sem executar a correção. "
-            "Neste benchmark local, chame apply_manifest com um Secret mínimo e sem placeholders "
-            "para satisfazer o volume obrigatório do DaemonSet. Use este manifesto:\n"
-            f"{manifest}"
-        )
-
-
-    def _should_force_newrelic_benchmark_manifest(self, manifest: Any) -> bool:
-        """
-        Bloqueia/substitui manifestos NewRelic que transformam o benchmark local
-        em execução real do agente New Relic.
-
-        Caso real:
-        - o Secret/newrelic-config foi criado corretamente;
-        - em seguida a LLM reaplicou DaemonSet/newrelic-agent com agente real;
-        - o container falhou por licença inválida;
-        - isso gerou loops, BackOff, alto consumo de tokens e falha final.
-
-        Para o benchmark, o DaemonSet deve permanecer estável com comando de loop.
-        """
-        content = str(manifest or "")
-        lower = content.lower()
-
-        if "kind: daemonset" not in lower:
-            return False
-
-        if "newrelic" not in lower and "new_relic" not in lower and "nria_license_key" not in lower:
-            return False
-
-        risky_markers = [
-            "newrelic/infrastructure:latest",
-            "envfrom:",
-            "nria_license_key",
-            "new_relic_license_key",
-            "/etc/newrelic-infra.yml",
-            "securitycontext:",
-            "privileged: true",
-        ]
-
-        if any(marker in lower for marker in risky_markers):
-            return True
-
-        # Mesmo sem marcador explícito, qualquer DaemonSet NewRelic sem o loop
-        # determinístico pode voltar a exigir licença real.
-        if "while true; do sleep 3600; done" not in lower:
-            return True
-
-        return False
-
-    def _build_newrelic_benchmark_daemonset_manifest(self, namespace: str) -> str:
-        """
-        Manifesto determinístico para estabilizar o 8-newrelic.yaml no benchmark.
-
-        Decisões:
-        - mantém o DaemonSet, pois é o tipo original do cenário;
-        - usa Secret/newrelic-config mínimo;
-        - mantém hostPath/hostNetwork/hostPID/hostIPC para compatibilidade com o cenário;
-        - NÃO executa o agente New Relic real;
-        - usa comando de loop para simular container estável;
-        - evita licença real e evita CrashLoopBackOff por invalid license.
-        """
-        namespace = self._resolve_namespace(namespace)
-
-        secret_manifest = self._build_newrelic_benchmark_secret_manifest(namespace)
-
-        daemonset_manifest = f"""apiVersion: apps/v1
-kind: DaemonSet
-metadata:
-  name: newrelic-agent
-  namespace: {namespace}
-  labels:
-    app: newrelic-agent
-    tier: monitoring
-    version: benchmark
-spec:
-  selector:
-    matchLabels:
-      name: newrelic
-  template:
-    metadata:
-      labels:
-        name: newrelic
-    spec:
-      hostNetwork: true
-      hostPID: true
-      hostIPC: true
-      containers:
-        - name: newrelic
-          image: newrelic/infrastructure
-          imagePullPolicy: IfNotPresent
-          command:
-            - /bin/sh
-            - -c
-            - --
-          args:
-            - echo 'Container iniciado e em execução...'; while true; do sleep 3600; done
-          env:
-            - name: NRSYSMOND_logfile
-              value: /var/log/nrsysmond.log
-            - name: NEW_RELIC_LICENSE_KEY
-              value: agentk-benchmark-license-key
-            - name: API_SECRET
-              value: agentk-benchmark-api-token
-          resources:
-            requests:
-              cpu: 100m
-          volumeMounts:
-            - name: newrelic-config
-              mountPath: /etc/kube-newrelic
-              readOnly: true
-            - name: dev
-              mountPath: /dev
-            - name: run
-              mountPath: /var/run/docker.sock
-            - name: sys
-              mountPath: /sys
-            - name: log
-              mountPath: /var/log
-      volumes:
-        - name: newrelic-config
-          secret:
-            secretName: newrelic-config
-        - name: dev
-          hostPath:
-            path: /dev
-        - name: run
-          hostPath:
-            path: /var/run/docker.sock
-            type: Socket
-        - name: sys
-          hostPath:
-            path: /sys
-        - name: log
-          hostPath:
-            path: /var/log
-"""
-
-        return secret_manifest + "---\n" + daemonset_manifest
 
     def _compact_tool_result(self, tool_name: str, result: Any) -> str:
         """
@@ -1639,48 +1185,6 @@ spec:
 
         return refs
 
-
-    def _resolve_namespace(self, namespace: Any = None) -> str:
-        """
-        Normaliza namespace vindo da LLM.
-
-        Se a LLM enviar namespace vazio, None ou string em branco, usa o
-        target_namespace da execução controlada. Isso evita vazamento para
-        default e evita listar recursos de namespaces errados.
-        """
-        value = ""
-
-        if namespace is not None:
-            value = str(namespace).strip()
-
-        if value:
-            return value
-
-        if self.target_namespace:
-            return self.target_namespace
-
-        return "default"
-
-    def _health_message_indicates_controller_creation_failure(self, message: str) -> bool:
-        text = str(message or "").lower()
-
-        markers = [
-            "failedcreate",
-            "serviceaccount",
-            "service account",
-            "não há pod para diagnosticar",
-            "nao ha pod para diagnosticar",
-            "controller não consegue criar pods",
-            "controller nao consegue criar pods",
-            "antes da criação de pods",
-            "antes da criacao de pods",
-            "replicafailure",
-            "forbidden",
-            "not found",
-        ]
-
-        return any(marker in text for marker in markers)
-
     def _run_early_healthcheck(self) -> str:
         if not self.health_checker or not self.target_namespace:
             return ""
@@ -1700,14 +1204,6 @@ spec:
                 return (
                     "[SISTEMA]: HealthCheck pós-apply confirmou sucesso. "
                     f"{message}. Finalize a execução sem novas chamadas de ferramenta."
-                )
-
-            if self._health_message_indicates_controller_creation_failure(message):
-                return (
-                    "[SISTEMA]: HealthCheck pós-apply detectou falha de criação de pods no controller. "
-                    f"Mensagem: {message}. Não use get_pod_diagnostics agora, pois não há pod ativo para diagnosticar. "
-                    "Liste o controller afetado, use get_resource_details nele e corrija serviceAccountName, "
-                    "ServiceAccount ausente, PVC, permissões ou template antes de reaplicar manifesto."
                 )
 
             return (
@@ -1928,11 +1424,6 @@ spec:
                 "sem declarar ações que não ocorreram."
             )
 
-        newrelic_reply_error = self._validate_newrelic_manual_secret_reply(reply_content)
-
-        if newrelic_reply_error:
-            return newrelic_reply_error
-
         return ""
 
     def _execute_tool(self, tool_name: str, args: Dict[str, Any]):
@@ -1948,14 +1439,12 @@ spec:
         from src.application.use_cases.list_resources_command import ListResourcesCommand
         from src.application.use_cases.scale_resource_command import ScaleResourceCommand
 
-        target_namespace = self._resolve_namespace(args.get("namespace"))
-
         if tool_name == "list_resources":
             resource_types = args.get("resource_types", ["pods"])
 
             return ListResourcesCommand(self.k8s_adapter).execute(
                 resource_types=resource_types,
-                namespace=target_namespace,
+                namespace=args.get("namespace", "default"),
             )
 
         if tool_name == "get_resource_details":
@@ -1979,7 +1468,7 @@ spec:
             return GetResourceDetailsCommand(self.k8s_adapter).execute(
                 args["resource_type"],
                 args["name"],
-                target_namespace,
+                args.get("namespace", "default"),
             )
 
         if tool_name == "list_namespaces":
@@ -2003,7 +1492,7 @@ spec:
 
             return GetPodDiagnosticsCommand(self.k8s_adapter).execute(
                 pod_name=args["pod_name"],
-                namespace=target_namespace,
+                namespace=args.get("namespace", "default"),
                 tail_lines=args.get("tail_lines", 80),
             )
 
@@ -2025,43 +1514,19 @@ spec:
 
             return GetPodLogsCommand(self.k8s_adapter).execute(
                 args["pod_name"],
-                target_namespace,
+                args.get("namespace", "default"),
                 args.get("tail_lines", 80),
             )
 
         if tool_name == "apply_manifest":
             manifest = args.get("manifest")
+            target_namespace = args.get("namespace") or "default"
 
             if not manifest:
                 return {
                     "status": "ERROR",
                     "message": "Conteúdo do parâmetro 'manifest' é obrigatório para execução.",
                 }
-
-            guardrail_note = ""
-
-            if self._should_force_elasticsearch_benchmark_manifest(manifest):
-                cleanup_result = DeleteResourceCommand(self.k8s_adapter).execute(
-                    "replication_controllers",
-                    "es",
-                    target_namespace,
-                )
-
-                manifest = self._build_elasticsearch_benchmark_manifest(target_namespace)
-
-                guardrail_note = (
-                    "Guardrail Elasticsearch/Minikube acionado: manifesto instável substituído por "
-                    "Service + Deployment determinístico, sem init-sysctl e sem imagem quay.io/pires. "
-                    f"Limpeza do ReplicationController antigo: {cleanup_result}"
-                )
-
-            if self._should_force_newrelic_benchmark_manifest(manifest):
-                manifest = self._build_newrelic_benchmark_daemonset_manifest(target_namespace)
-
-                guardrail_note = (
-                    "Guardrail NewRelic/benchmark acionado: manifesto de agente real substituído por "
-                    "Secret + DaemonSet determinístico com comando de loop, evitando falha por licença inválida."
-                )
 
             incoming_hash = self._hash_manifest(manifest)
 
@@ -2074,16 +1539,10 @@ spec:
                     ),
                 }
 
-            apply_result = ApplyManifestCommand(self.k8s_adapter).execute(
+            return ApplyManifestCommand(self.k8s_adapter).execute(
                 manifest=manifest,
                 namespace=target_namespace,
             )
-
-            if guardrail_note and isinstance(apply_result, dict):
-                original_message = str(apply_result.get("message", "") or "")
-                apply_result["message"] = f"{guardrail_note}. Resultado do apply: {original_message}"
-
-            return apply_result
 
         if tool_name == "delete_resource":
             missing = [
@@ -2104,7 +1563,7 @@ spec:
             return DeleteResourceCommand(self.k8s_adapter).execute(
                 args["resource_type"],
                 args["name"],
-                target_namespace,
+                args.get("namespace", "default"),
             )
 
         if tool_name == "scale_resource":
@@ -2127,7 +1586,7 @@ spec:
                 args["resource_type"],
                 args["name"],
                 int(args["replicas"]),
-                target_namespace,
+                args.get("namespace", "default"),
             )
 
         return {

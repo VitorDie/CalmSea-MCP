@@ -68,33 +68,8 @@ class K8sHealthChecker:
 
             if not pods:
                 stable_success_count = 0
-
-                events = self._get_namespace_events(ns)
-                active_controller_keys = self._get_active_controller_keys(ns)
-                controller_failure = self._detect_controller_failed_create_events(
-                    events,
-                    active_controller_keys=active_controller_keys,
-                )
-
-                if controller_failure:
-                    return False, self._truncate_message(controller_failure)
-
-                workloads_stable, workload_message = self._check_workloads_stable(ns)
-
-                if not workloads_stable:
-                    hard_failure = self._extract_hard_workload_failure(workload_message)
-
-                    if hard_failure:
-                        return False, self._truncate_message(hard_failure)
-
-                    print(
-                        f"[*] {ns}: Aguardando criação dos recursos... "
-                        f"Workloads ainda não estabilizados: {workload_message}"
-                    )
-                else:
-                    print(f"[*] {ns}: Aguardando criação dos recursos...")
-
-                time.sleep(getattr(self, "POLL_INTERVAL_SECONDS", 5))
+                print(f"[*] {ns}: Aguardando criação dos recursos...")
+                time.sleep(self.POLL_INTERVAL_SECONDS)
                 continue
 
             terminal_failure = self._detect_terminal_failed_pods(pods)
@@ -170,13 +145,11 @@ class K8sHealthChecker:
                     not_ready_pod_names.add(pod_name)
 
             events = self._get_namespace_events(ns)
-            active_controller_keys = self._get_active_controller_keys(ns)
 
             critical_event = self._detect_critical_events(
                 events=events,
                 active_pod_names=active_pod_names,
                 not_ready_pod_names=not_ready_pod_names,
-                active_controller_keys=active_controller_keys,
             )
 
             if critical_event:
@@ -270,40 +243,6 @@ class K8sHealthChecker:
                 "data": {},
                 "error": str(exc),
             }
-
-
-    def _get_active_controller_keys(self, namespace: str) -> Set[str]:
-        """
-        Retorna controllers atualmente existentes no namespace.
-
-        Isso evita reprovar o HealthCheck por eventos antigos de controllers
-        que já foram removidos, como ReplicationController/es após migração
-        para Deployment/es.
-        """
-        keys: Set[str] = set()
-
-        resources = [
-            ("replicationcontrollers", "ReplicationController"),
-            ("replicasets", "ReplicaSet"),
-            ("deployments", "Deployment"),
-            ("statefulsets", "StatefulSet"),
-            ("daemonsets", "DaemonSet"),
-            ("jobs", "Job"),
-        ]
-
-        for resource_name, kind in resources:
-            result = self._kubectl_json(["get", resource_name, "-n", namespace, "-o", "json"])
-
-            if not result.get("ok"):
-                continue
-
-            for item in result.get("data", {}).get("items", []) or []:
-                name = item.get("metadata", {}).get("name")
-
-                if name:
-                    keys.add(f"{kind}/{name}")
-
-        return keys
 
     def _get_namespace_events(self, namespace: str) -> List[Dict[str, Any]]:
         events_result = self._kubectl_json([
@@ -458,38 +397,18 @@ class K8sHealthChecker:
 
             name = metadata.get("name", "<replicationcontroller>")
             desired = spec.get("replicas", 1) or 0
-            current = status.get("replicas", 0) or 0
             ready = status.get("readyReplicas", 0) or 0
             available = status.get("availableReplicas", 0) or 0
 
-            for condition in status.get("conditions", []) or []:
-                condition_type = condition.get("type", "")
-                condition_status = str(condition.get("status", "")).lower()
-                reason = condition.get("reason", "")
-                message = condition.get("message", "")
-
-                if condition_type == "ReplicaFailure" and condition_status == "true":
-                    unstable.append(
-                        (
-                            f"replicationcontroller/{name} ReplicaFailure reason={reason}, "
-                            f"desired={desired}, current={current}, ready={ready}, available={available}, "
-                            f"message={message}"
-                        )
-                    )
-
-            if ready < desired or available < desired or current < desired:
+            if ready < desired or available < desired:
                 unstable.append(
-                    (
-                        f"replicationcontroller/{name} desired={desired}, current={current}, "
-                        f"ready={ready}, available={available}"
-                    )
+                    f"replicationcontroller/{name} desired={desired}, ready={ready}, available={available}"
                 )
 
         if unstable:
             return False, "ReplicationControllers instáveis: " + "; ".join(unstable[:5])
 
         return True, "ReplicationControllers estáveis."
-
 
     def _detect_terminal_failed_pods(self, pods: List[Dict[str, Any]]) -> str:
         failed_pods = []
@@ -702,133 +621,11 @@ class K8sHealthChecker:
             f"groups=[{', '.join(group_parts)}]; sample=[{sample_text}]"
         )
 
-
-    def _detect_controller_failed_create_events(
-        self,
-        events: List[Dict[str, Any]],
-        active_controller_keys: Set[str] = None,
-    ) -> str:
-        """
-        Detecta falhas de criação de pods em controllers antes mesmo de existir pod.
-
-        Ignora eventos antigos de controllers que já não existem mais no namespace.
-        Exemplo: ReplicationController/es removido após migração para Deployment/es.
-        """
-        active_controller_keys = active_controller_keys or set()
-
-        controller_kinds = {
-            "ReplicationController",
-            "ReplicaSet",
-            "Deployment",
-            "StatefulSet",
-            "DaemonSet",
-            "Job",
-            "CronJob",
-        }
-
-        active_controller_keys = active_controller_keys or set()
-
-        for event in events:
-            reason = event.get("reason", "")
-            message = event.get("message", "")
-            involved = event.get("involvedObject", {}) or {}
-            involved_kind = involved.get("kind", "")
-            involved_name = involved.get("name", "")
-
-            if reason != "FailedCreate":
-                continue
-
-            if involved_kind not in controller_kinds:
-                continue
-
-            controller_key = f"{involved_kind}/{involved_name}"
-
-            if active_controller_keys and controller_key not in active_controller_keys:
-                continue
-
-            return self._format_failed_create_message(
-                involved_kind=involved_kind,
-                involved_name=involved_name,
-                message=message,
-            )
-
-        return ""
-
-
-    def _extract_hard_workload_failure(self, workload_message: str) -> str:
-        """
-        Converte mensagens de workload instável em falhas críticas quando já há
-        evidência determinística de que o controller não conseguirá criar pods.
-        """
-        message = str(workload_message or "")
-        lower = message.lower()
-
-        hard_markers = [
-            "failedcreate",
-            "replicafailure",
-            "serviceaccount",
-            "service account",
-            "not found",
-            "forbidden",
-            "exceeded quota",
-            "persistentvolumeclaim",
-            "pod has unbound immediate persistentvolumeclaims",
-        ]
-
-        if any(marker in lower for marker in hard_markers):
-            return (
-                "Falha crítica de controller antes da criação de pods. "
-                f"Detalhes: {message}"
-            )
-
-        return ""
-
-    def _format_failed_create_message(
-        self,
-        involved_kind: str,
-        involved_name: str,
-        message: str,
-    ) -> str:
-        service_account = self._extract_serviceaccount_missing(message)
-
-        if service_account:
-            return (
-                f"Falha crítica em {involved_kind}/{involved_name}: FailedCreate. "
-                f"ServiceAccount ausente: {service_account}. "
-                f"Mensagem: {message}. "
-                "O controller não consegue criar pods; não há pod para diagnosticar. "
-                "Corrija criando a ServiceAccount ausente ou removendo serviceAccountName/serviceAccount "
-                "do template antes de aguardar estabilidade."
-            )
-
-        return (
-            f"Falha crítica em {involved_kind}/{involved_name}: FailedCreate. "
-            f"Mensagem: {message}. "
-            "O controller não consegue criar pods; não há pod para diagnosticar. "
-            "Corrija o template do controller antes de aguardar estabilidade."
-        )
-
-    def _extract_serviceaccount_missing(self, message: str) -> str:
-        patterns = [
-            r'serviceaccount "([^"]+)" not found',
-            r'service account [^/\s]+/([^:\s]+)',
-            r'serviceaccount\.([^\s]+) not found',
-        ]
-
-        for pattern in patterns:
-            match = re.search(pattern, message or "", re.IGNORECASE)
-
-            if match:
-                return match.group(1)
-
-        return ""
-
     def _detect_critical_events(
         self,
         events: List[Dict[str, Any]],
         active_pod_names: Set[str],
         not_ready_pod_names: Set[str],
-        active_controller_keys: Set[str] = None,
     ) -> str:
         for event in events:
             reason = event.get("reason", "")
@@ -836,26 +633,6 @@ class K8sHealthChecker:
             involved = event.get("involvedObject", {}) or {}
             involved_kind = involved.get("kind", "")
             involved_name = involved.get("name", "")
-
-            if reason == "FailedCreate" and involved_kind in {
-                "ReplicationController",
-                "ReplicaSet",
-                "Deployment",
-                "StatefulSet",
-                "DaemonSet",
-                "Job",
-                "CronJob",
-            }:
-                controller_key = f"{involved_kind}/{involved_name}"
-
-                if active_controller_keys and controller_key not in active_controller_keys:
-                    continue
-
-                return self._format_failed_create_message(
-                    involved_kind=involved_kind,
-                    involved_name=involved_name,
-                    message=message,
-                )
 
             if involved_kind == "Pod":
                 if involved_name not in active_pod_names:

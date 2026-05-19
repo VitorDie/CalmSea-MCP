@@ -11,6 +11,18 @@ from typing import Any, Dict, List
 from src.application.interfaces.k8s_service_interface import K8sServiceInterface
 from src.application.interfaces.llm_provider import LLMProviderInterface
 from src.application.tools_definitions import TOOLS_SCHEMA
+from src.application.early_stop.early_stop_service import EarlyStopService
+from src.application.watchdogs.models import ReplyValidationContext, ToolExecutionContext
+from src.application.watchdogs.watchdog_service import WatchdogService
+from src.application.guardrails.guardrail_registry import GuardrailRegistry
+from src.application.policies.action_safety_models import ActionSafetyContext
+from src.application.policies.action_safety_policy import ActionSafetyPolicy
+from src.application.resource_registry.resource_registry import ResourceRegistry
+from src.application.operational_state.operational_state_manager import OperationalStateManager
+from src.application.tool_call_recovery.tool_call_recovery_service import ToolCallRecoveryService
+from src.application.next_action.next_action_policy import NextActionPolicy
+from src.application.history_compaction.history_compactor_service import HistoryCompactorService
+from src.application.tool_contracts.tool_result_normalizer import ToolResultNormalizer
 
 
 class AgentService:
@@ -65,9 +77,32 @@ class AgentService:
         self._last_apply_success = False
         self._last_tool_error = None
         self._blocked_reply_count = 0
+        self._tool_call_recovery_blocked_count = 0
         self._executed_tool_names = []
         self._executed_iterations = 0
         self._last_health_after_apply = None
+        self._last_early_stop_response = ""
+
+        self.watchdog_service = WatchdogService(
+            max_log_chars=self.MAX_LOG_CHARS,
+        )
+
+        self.early_stop_service = EarlyStopService(
+            health_checker=self.health_checker,
+            target_namespace=self.target_namespace,
+            timeout=self.early_healthcheck_timeout,
+        )
+
+        self.guardrail_registry = GuardrailRegistry()
+        self.resource_registry = ResourceRegistry()
+        self.action_safety_policy = ActionSafetyPolicy(
+            resource_registry=self.resource_registry,
+        )
+        self.tool_result_normalizer = ToolResultNormalizer()
+        self.operational_state_manager = OperationalStateManager(target_namespace=self.target_namespace)
+        self.tool_call_recovery_service = ToolCallRecoveryService()
+        self.next_action_policy = NextActionPolicy()
+        self.history_compactor = HistoryCompactorService()
 
         self.system_instruction = (
             "Você é AgentK, especialista em diagnóstico, correção e otimização de recursos YAML do Kubernetes.\n"
@@ -243,6 +278,76 @@ class AgentService:
                     flush=True,
                 )
 
+                tool_call_recovery_error = self._build_tool_call_recovery_error(decision)
+
+                if tool_call_recovery_error:
+
+
+                    self._tool_call_recovery_blocked_count += 1
+
+
+
+                    print(
+
+
+                        "[TOOL_CALL_RECOVERY] Resposta textual bloqueada "
+
+
+                        f"{self._tool_call_recovery_blocked_count}/2: "
+
+
+                        f"{tool_call_recovery_error}",
+
+
+                        flush=True,
+
+
+                    )
+
+
+
+                    if self._tool_call_recovery_blocked_count >= 2:
+
+
+                        return (
+
+
+                            "⚠️ Execução interrompida pelo ToolCallRecovery: "
+
+
+                            "o modelo insistiu em declarar execução de ferramenta "
+
+
+                            "em texto livre sem retornar uma tool call real. "
+
+
+                            "O cluster não deve ser considerado corrigido. "
+
+
+                            f"Última orientação do sistema: {tool_call_recovery_error}"
+
+
+                        )
+
+
+
+                    self._append_history(
+
+
+                        history,
+
+
+                        "user",
+
+
+                        tool_call_recovery_error,
+
+
+                    )
+
+
+                    continue
+
                 reply_validation_error = self._validate_reply_before_return(reply_content)
 
                 if reply_validation_error:
@@ -382,9 +487,12 @@ class AgentService:
                             msg = f"{msg}\n\n{health_msg}"
 
                             if health_msg.startswith("[SISTEMA]: HealthCheck pós-apply confirmou sucesso"):
-                                early_stop_response = self._build_early_success_response(
-                                    health_msg=health_msg,
-                                    tool_result=result,
+                                early_stop_response = (
+                                    self._last_early_stop_response
+                                    or self._build_early_success_response(
+                                        health_msg=health_msg,
+                                        tool_result=result,
+                                    )
                                 )
 
                     compact_result = self._compact_tool_result(
@@ -407,6 +515,8 @@ class AgentService:
                             f"{msg}"
                         ),
                     )
+
+                    self._refresh_operational_state_history(history)
 
                     if early_stop_response:
                         total_elapsed = time.perf_counter() - run_started_at
@@ -520,6 +630,32 @@ class AgentService:
 
         return None
 
+    def _build_generic_watchdog_message(
+        self,
+        tool_name: str,
+        args: Dict[str, Any],
+        result: Any,
+    ) -> str:
+        """
+        Usa WatchdogService para ferramentas que não dependem de fastpaths
+        específicos ainda mantidos no AgentService.
+        """
+        decision = self.watchdog_service.build_after_tool_message(
+            ToolExecutionContext(
+                tool_name=tool_name,
+                args=args,
+                result=result,
+                last_obs_hash=self._last_obs_hash,
+                last_manifest_hash=self._last_manifest_hash,
+                last_apply_success=self._last_apply_success,
+                last_tool_error=self._last_tool_error,
+                target_namespace=self.target_namespace,
+                executed_tool_names=list(self._executed_tool_names),
+            )
+        )
+
+        return decision.message
+
     def _build_watchdog_message(
         self,
         tool_name: str,
@@ -534,188 +670,34 @@ class AgentService:
         msg = "Ação aceita."
 
         if tool_name == "list_resources":
-            msg = (
-                "Próximo passo recomendado: selecione apenas os recursos suspeitos "
-                "e use get_resource_details neles. Evite buscar detalhes de tudo."
+            msg = self._build_generic_watchdog_message(
+                tool_name=tool_name,
+                args=args,
+                result=result,
             )
 
         elif tool_name == "get_resource_details":
-            obs_signature = self._hash_payload(result)
-            pod_fastpath_msg = self._build_pod_detail_fastpath_message(result)
-            workload_fastpath_msg = self._build_workload_detail_fastpath_message(result)
-            newrelic_fastpath_msg = self._build_newrelic_detail_fastpath_message(result)
-            storm_fastpath_msg = self._build_storm_detail_fastpath_message(result)
-            mongodb_fastpath_msg = self._build_mongodb_detail_fastpath_message(result)
-
-            if pod_fastpath_msg:
-                msg = pod_fastpath_msg
-            elif workload_fastpath_msg:
-                msg = workload_fastpath_msg
-            elif newrelic_fastpath_msg:
-                msg = newrelic_fastpath_msg
-            elif storm_fastpath_msg:
-                msg = storm_fastpath_msg
-            elif mongodb_fastpath_msg:
-                msg = mongodb_fastpath_msg
-            elif obs_signature == self._last_obs_hash:
-                msg = (
-                    "SISTEMA: Estagnação detectada. O estado observado não mudou. "
-                    "Use get_pod_diagnostics se houver pod instável ou revise o manifesto antes de reaplicar."
-                )
-            else:
-                msg = (
-                    "Detalhes obtidos. Se houver erro em pod, service, selector, secret, image ou volume, "
-                    "corrija somente o necessário."
-                )
-
-            self._last_obs_hash = obs_signature
-
-        elif tool_name == "get_pod_diagnostics":
-            detected_issue_types = self._extract_detected_issue_types(result)
-            logs_text = ""
-
-            if isinstance(result, dict):
-                logs_text = str(result.get("logs_tail", "") or "").lower()
-
-            if "container_command_not_found" in detected_issue_types:
-                msg = (
-                    "Diagnóstico estruturado do pod obtido. Causa prioritária: command/entrypoint inexistente. "
-                    "Remova ou corrija command/args antes de reaplicar. Se estiver usando imagem oficial, "
-                    "não referencie script customizado que não existe dentro da imagem."
-                )
-            elif detected_issue_types.intersection({"image_pull_error", "image_pull_backoff", "err_image_pull"}):
-                msg = (
-                    "Diagnóstico estruturado do pod obtido. Causa prioritária: falha de pull de imagem. "
-                    "Corrija imagem/tag para uma existente e não invente tags. Após trocar a imagem, "
-                    "garanta que command, probes, env e volumes sejam compatíveis com a nova imagem."
-                )
-            elif detected_issue_types.intersection({"missing_secret", "missing_configmap", "failed_mount"}):
-                msg = (
-                    "Diagnóstico estruturado do pod obtido. Causa prioritária: FailedMount por Secret/ConfigMap ausente. "
-                    "Crie recursos ausentes com valores reais válidos ou remova as referências de volume. "
-                    "Não use placeholders, certificados fictícios, base64 inválido ou textos como <CERT PEM CONTENT>."
-                )
-            elif detected_issue_types.intersection({"create_container_config_error"}):
-                msg = (
-                    "Diagnóstico estruturado do pod obtido. Causa prioritária: erro de configuração do container. "
-                    "Verifique Secret/ConfigMap referenciados por env, envFrom, volumeMounts e chaves ausentes. "
-                    "Se a mensagem citar couldn't find key, corrija o Secret antes de reaplicar."
-                )
-            elif "unknown option '--ignore-db-dir'" in logs_text:
-                msg = (
-                    "Diagnóstico estruturado do pod obtido. Logs indicam que MySQL não aceita '--ignore-db-dir'. "
-                    "Remova esse argumento do container antes de reaplicar."
-                )
-            elif "no license key" in logs_text or "nria_license_key" in logs_text:
-                msg = (
-                    "Diagnóstico estruturado do pod obtido. Logs indicam ausência de licença New Relic. "
-                    "Configure NRIA_LICENSE_KEY por Secret real ou explique que não é possível estabilizar o agente sem licença."
-                )
-            else:
-                msg = (
-                    "Diagnóstico estruturado do pod obtido. Use detected_issues, probable_root_cause "
-                    "e recommended_actions para corrigir a causa raiz antes de reaplicar manifesto."
-                )
-
-        elif tool_name == "get_pod_logs":
-            logs_lower = result_text_lower
-
-            if "unknown option '--ignore-db-dir'" in logs_lower:
-                msg = (
-                    "Logs obtidos. Causa provável: argumento inválido do MySQL. "
-                    "Remova '--ignore-db-dir' e reaplique somente o Deployment corrigido."
-                )
-            elif "no license key" in logs_lower:
-                msg = (
-                    "Logs obtidos. Causa provável: licença New Relic ausente. "
-                    "Configure NRIA_LICENSE_KEY via Secret real ou informe que a estabilização depende desse valor."
-                )
-            else:
-                msg = (
-                    "Logs obtidos. Use essas evidências para corrigir a causa raiz. "
-                    "Não reaplique YAML sem incorporar o diagnóstico dos logs."
-                )
-
-        elif tool_name == "apply_manifest":
-            manifest_hash = self._hash_manifest(args.get("manifest", ""))
-
-            if (
-                "no matches for kind" in result_text_lower
-                and "replicationcontroller" in result_text_lower
-                and "apps/v1" in result_text_lower
-            ):
-                msg = (
-                    "SISTEMA: O dry-run falhou porque ReplicationController foi usado com apiVersion apps/v1. "
-                    "Isso está incorreto. ReplicationController é recurso nativo do Kubernetes em apiVersion v1, "
-                    "não é CRD. Corrija o manifesto para apiVersion: v1 e chame apply_manifest novamente. "
-                    "Não responda ao usuário antes de tentar a correção."
-                )
-
-            elif "placeholder" in result_text_lower or "valores fictícios" in result_text_lower:
-                msg = (
-                    "SISTEMA: O manifesto foi bloqueado porque contém placeholders ou valores fictícios. "
-                    "Não reaplique com BASE64_CERT_HERE, BASE64_KEY_HERE, <CERT PEM CONTENT>, '...' ou textos instrutivos. "
-                    "Substitua por valores reais válidos ou remova o recurso/campo que depende desses valores."
-                )
-
-            elif "illegal base64 data" in result_text_lower:
-                msg = (
-                    "SISTEMA: O dry-run falhou por base64 inválido. "
-                    "Não use BASE64_CERT_HERE, BASE64_KEY_HERE ou textos de exemplo em data. "
-                    "Use stringData com valor real quando apropriado ou remova o Secret TLS se não houver certificado real."
-                )
-
-            elif "field is immutable" in result_text_lower and "secret" in result_text_lower:
-                msg = (
-                    "SISTEMA: O dry-run falhou porque o tipo/campo imutável de um Secret existente mudou. "
-                    "Remova o Secret antigo com delete_resource somente se for seguro e necessário, ou mantenha o tipo atual. "
-                    "Não tente transformar Secret Opaque em kubernetes.io/tls com placeholder."
-                )
-
-            elif "dry-run falhou" in result_text_lower or "dry-run failed" in result_text_lower:
-                msg = (
-                    "SISTEMA: O dry-run falhou e o manifesto não foi aplicado. "
-                    "Analise a mensagem de erro, corrija o YAML e chame apply_manifest novamente. "
-                    "Não trate uma falha de dry-run como correção concluída."
-                )
-
-            elif manifest_hash == self._last_manifest_hash:
-                self._repeated_manifest_count += 1
-                msg = (
-                    "SISTEMA: Manifesto idêntico ou praticamente igual já foi aplicado. "
-                    "Não reaplique em loop. Se o ambiente ainda não estabilizou, "
-                    "use get_pod_diagnostics no pod não pronto ou corrija apenas o campo responsável pela falha."
-                )
-
-            else:
-                self._repeated_manifest_count = 0
-                msg = (
-                    "Manifesto enviado ao adapter. O adapter executa dry-run server-side antes do apply real. "
-                    "Agora verifique o estado com list_resources e detalhes apenas dos recursos afetados."
-                )
-
-            self._last_manifest_hash = manifest_hash
-
-        should_preserve_apply_manifest_guidance = (
-            tool_name == "apply_manifest"
-            and (
-                "dry-run falhou" in result_text_lower
-                or "dry-run failed" in result_text_lower
-                or "no matches for kind" in result_text_lower
-                or "placeholder" in result_text_lower
-                or "valores fictícios" in result_text_lower
+            msg = self._build_generic_watchdog_message(
+                tool_name=tool_name,
+                args=args,
+                result=result,
             )
-        )
 
-        if (
-            "ERROR" in result_text
-            or "Erro" in result_text
-            or "erro" in result_text
-            or "falhou" in result_text_lower
-        ) and not should_preserve_apply_manifest_guidance:
-            msg = (
-                "BLOQUEIO: O comando indicou falha. Analise o erro antes de prosseguir. "
-                f"Resultado: {self._truncate(result_text, 900)}"
+        elif tool_name in {"get_pod_diagnostics", "get_pod_logs", "apply_manifest"}:
+            msg = self._build_generic_watchdog_message(
+                tool_name=tool_name,
+                args=args,
+                result=result,
+            )
+
+            if tool_name == "apply_manifest":
+                self._last_manifest_hash = self._hash_manifest(args.get("manifest", ""))
+
+        else:
+            msg = self._build_generic_watchdog_message(
+                tool_name=tool_name,
+                args=args,
+                result=result,
             )
 
         return msg
@@ -834,918 +816,77 @@ class AgentService:
 
 
 
-    def _build_workload_detail_fastpath_message(self, result: Any) -> str:
-        """
-        Gera orientação determinística para workloads Kubernetes com padrões
-        problemáticos conhecidos.
-
-        Caso real: 7-elasticsearch.yaml.
-        """
-        if not isinstance(result, dict):
-            return ""
-
-        kind = str(result.get("kind", "") or "")
-        kind_lower = kind.lower()
-
-        if kind_lower not in {"replicationcontroller", "deployment", "replicaset", "statefulset"}:
-            return ""
-
-        metadata = result.get("metadata", {}) or {}
-        spec = result.get("spec", {}) or {}
-
-        name = metadata.get("name") or "<nome>"
-        namespace = metadata.get("namespace") or self.target_namespace or "<namespace>"
-
-        serialized = self._safe_json_dumps(result).lower()
-
-        is_elasticsearch = (
-            name == "es"
-            or "elasticsearch" in serialized
-            or "docker.elastic.co/elasticsearch" in serialized
-            or "quay.io/pires/docker-elasticsearch-kubernetes" in serialized
-        )
-
-        if not is_elasticsearch:
-            return ""
-
-        has_pires_image = "quay.io/pires/docker-elasticsearch-kubernetes" in serialized
-        has_latest_or_untagged = (
-            "quay.io/pires/docker-elasticsearch-kubernetes:latest" in serialized
-            or '"image": "quay.io/pires/docker-elasticsearch-kubernetes"' in serialized
-            or "'image': 'quay.io/pires/docker-elasticsearch-kubernetes'" in serialized
-        )
-        has_init_sysctl = "init-sysctl" in serialized or "vm.max_map_count" in serialized
-        missing_single_node = "discovery.type" not in serialized
-        missing_java_opts = "es_java_opts" not in serialized
-
-        if not (has_pires_image or has_latest_or_untagged or has_init_sysctl or missing_single_node or missing_java_opts):
-            return ""
-
-        return (
-            "SISTEMA: get_resource_details identificou workload Elasticsearch com padrão instável para Minikube. "
-            f"Recurso: {kind}/{name} no namespace {namespace}. "
-            "Problemas prováveis: imagem quay.io/pires/docker-elasticsearch-kubernetes sem tag válida ou com latest, "
-            "initContainer init-sysctl/vm.max_map_count sujeito a falha, ausência de discovery.type=single-node "
-            "e ausência de ES_JAVA_OPTS. "
-            "Não continue reaplicando variações do mesmo ReplicationController. "
-            "Próxima ação eficiente: remover o ReplicationController antigo e aplicar manifesto determinístico "
-            "com Service + Deployment apps/v1, imagem docker.elastic.co/elasticsearch/elasticsearch:7.17.11, "
-            "discovery.type=single-node, xpack.security.enabled=false, ES_JAVA_OPTS=-Xms128m -Xmx128m, "
-            "emptyDir e sem init-sysctl."
-        )
-
-    def _should_force_elasticsearch_benchmark_manifest(self, manifest: Any) -> bool:
-        """
-        Bloqueia/substitui automaticamente manifestos Elasticsearch que repetem
-        padrões conhecidos de falha no benchmark local.
-
-        O objetivo é evitar loops caros como:
-        - ReplicationController/es reaplicado várias vezes;
-        - quay.io/pires/docker-elasticsearch-kubernetes sem tag/latest;
-        - init-sysctl com vm.max_map_count;
-        - ausência de discovery.type=single-node e ES_JAVA_OPTS.
-        """
-        text = str(manifest or "")
-        lower = text.lower()
-
-        if "elasticsearch" not in lower and "name: es" not in lower:
-            return False
-
-        if "replicationcontroller" not in lower and "kind: deployment" not in lower:
-            return False
-
-        bad_markers = [
-            "quay.io/pires/docker-elasticsearch-kubernetes",
-            "init-sysctl",
-            "vm.max_map_count",
-            "hostpid: true",
-        ]
-
-        missing_required_runtime = (
-            "discovery.type" not in lower
-            or "single-node" not in lower
-            or "es_java_opts" not in lower
-            or "xpack.security.enabled" not in lower
-        )
-
-        return any(marker in lower for marker in bad_markers) or missing_required_runtime
-
-    def _build_elasticsearch_benchmark_manifest(self, namespace: str) -> str:
-        """
-        Manifesto determinístico e leve para benchmark local em Minikube.
-
-        Decisões:
-        - troca ReplicationController por Deployment apps/v1;
-        - remove init-sysctl e vm.max_map_count;
-        - usa Elasticsearch oficial com tag explícita;
-        - ativa single-node;
-        - desativa xpack security;
-        - limita heap para reduzir risco de OOMKilled;
-        - usa emptyDir para benchmark.
-        """
-        namespace = self._resolve_namespace(namespace)
-
-        return f"""apiVersion: v1
-kind: Service
-metadata:
-  name: elasticsearch
-  namespace: {namespace}
-  labels:
-    component: elasticsearch
-spec:
-  type: ClusterIP
-  selector:
-    component: elasticsearch
-  ports:
-    - name: http
-      port: 9200
-      targetPort: 9200
-      protocol: TCP
-    - name: transport
-      port: 9300
-      targetPort: 9300
-      protocol: TCP
----
-apiVersion: apps/v1
-kind: Deployment
-metadata:
-  name: es
-  namespace: {namespace}
-  labels:
-    component: elasticsearch
-spec:
-  replicas: 1
-  selector:
-    matchLabels:
-      component: elasticsearch
-  template:
-    metadata:
-      labels:
-        component: elasticsearch
-    spec:
-      securityContext:
-        fsGroup: 1000
-      containers:
-        - name: es
-          image: docker.elastic.co/elasticsearch/elasticsearch:7.17.11
-          imagePullPolicy: IfNotPresent
-          ports:
-            - name: http
-              containerPort: 9200
-              protocol: TCP
-            - name: transport
-              containerPort: 9300
-              protocol: TCP
-          env:
-            - name: discovery.type
-              value: single-node
-            - name: xpack.security.enabled
-              value: "false"
-            - name: ES_JAVA_OPTS
-              value: "-Xms128m -Xmx128m"
-            - name: cluster.name
-              value: agentk-es
-            - name: network.host
-              value: "0.0.0.0"
-          resources:
-            requests:
-              cpu: 100m
-              memory: 384Mi
-            limits:
-              cpu: 1000m
-              memory: 768Mi
-          volumeMounts:
-            - name: storage
-              mountPath: /usr/share/elasticsearch/data
-          readinessProbe:
-            tcpSocket:
-              port: 9200
-            initialDelaySeconds: 40
-            periodSeconds: 10
-            timeoutSeconds: 5
-            failureThreshold: 12
-      volumes:
-        - name: storage
-          emptyDir: {{}}
-"""
-
-
-    def _build_newrelic_detail_fastpath_message(self, result: Any) -> str:
-        """
-        Fastpath determinístico para o cenário 8-newrelic.yaml.
-
-        Caso real:
-        - DaemonSet/newrelic-agent referencia Secret/newrelic-config;
-        - Secret não existe;
-        - pod fica em ContainerCreating por FailedMount;
-        - o agente não deve responder pedindo preenchimento manual com placeholders;
-        - para benchmark local, basta criar um Secret mínimo sem valores sensíveis reais.
-        """
-        if not isinstance(result, dict):
-            return ""
-
-        kind = str(result.get("kind", "") or "").lower()
-
-        if kind != "daemonset":
-            return ""
-
-        metadata = result.get("metadata", {}) or {}
-        spec = result.get("spec", {}) or {}
-
-        name = metadata.get("name") or ""
-        namespace = metadata.get("namespace") or self.target_namespace or "default"
-
-        serialized = self._safe_json_dumps(result).lower()
-
-        is_newrelic = (
-            name == "newrelic-agent"
-            or "newrelic" in serialized
-            or "new_relic_license_key" in serialized
-            or "newrelic-config" in serialized
-        )
-
-        if not is_newrelic:
-            return ""
-
-        references_missing_secret_candidate = "newrelic-config" in serialized
-
-        if not references_missing_secret_candidate:
-            return ""
-
-        secret_manifest = self._build_newrelic_benchmark_secret_manifest(namespace)
-
-        return (
-            "SISTEMA: get_resource_details identificou DaemonSet NewRelic que referencia "
-            "Secret/newrelic-config. Se o Secret estiver ausente, o pod ficará em ContainerCreating "
-            "com FailedMount. Para este benchmark local, não responda pedindo que o usuário preencha "
-            "placeholders ou valores reais. Próxima ação eficiente: chame apply_manifest agora com "
-            "um Secret mínimo, sem placeholders, para satisfazer o volume obrigatório. "
-            "Manifesto recomendado:\n"
-            f"{secret_manifest}"
-        )
-
-    def _build_newrelic_benchmark_secret_manifest(self, namespace: str) -> str:
-        """
-        Secret mínimo para estabilizar o cenário 8-newrelic.yaml em benchmark local.
-
-        Não usa placeholders como <BASE64...> e não usa credenciais reais.
-        O objetivo é permitir o mount do volume newrelic-config; o container do cenário
-        já executa um loop de longa duração e não depende de conexão real com New Relic.
-        """
-        namespace = self._resolve_namespace(namespace)
-
-        return f"""apiVersion: v1
-kind: Secret
-metadata:
-  name: newrelic-config
-  namespace: {namespace}
-type: Opaque
-stringData:
-  newrelic-infra.yml: |
-    license_key: agentk-benchmark-license-key
-    display_name: agentk-minikube
-  NEW_RELIC_LICENSE_KEY: agentk-benchmark-license-key
-  API_SECRET: agentk-benchmark-api-token
-"""
-
-    def _validate_newrelic_manual_secret_reply(self, reply_content: str) -> str:
-        """
-        Bloqueia resposta final que apenas orienta criação manual do Secret NewRelic
-        com placeholders, sem executar apply_manifest.
-        """
-        content = str(reply_content or "")
-        lower = content.lower()
-
-        if "newrelic-config" not in lower:
-            return ""
-
-        if self._last_apply_success:
-            return ""
-
-        manual_markers = [
-            "preencha",
-            "substitua",
-            "<base64",
-            "base64_da",
-            "base64_do",
-            "você deve fornecer",
-            "voce deve fornecer",
-            "kubectl apply -f",
-            "criar o secret",
-            "crie o secret",
-        ]
-
-        if not any(marker in lower for marker in manual_markers):
-            return ""
-
-        manifest = self._build_newrelic_benchmark_secret_manifest(self.target_namespace or "default")
-
-        return (
-            "[SISTEMA]: A resposta final foi bloqueada porque apenas orienta criação manual "
-            "do Secret/newrelic-config, possivelmente com placeholders, sem executar a correção. "
-            "Neste benchmark local, chame apply_manifest com um Secret mínimo e sem placeholders "
-            "para satisfazer o volume obrigatório do DaemonSet. Use este manifesto:\n"
-            f"{manifest}"
-        )
-
-
-    def _should_force_newrelic_benchmark_manifest(self, manifest: Any) -> bool:
-        """
-        Bloqueia/substitui manifestos NewRelic que transformam o benchmark local
-        em execução real do agente New Relic.
-
-        Caso real:
-        - o Secret/newrelic-config foi criado corretamente;
-        - em seguida a LLM reaplicou DaemonSet/newrelic-agent com agente real;
-        - o container falhou por licença inválida;
-        - isso gerou loops, BackOff, alto consumo de tokens e falha final.
-
-        Para o benchmark, o DaemonSet deve permanecer estável com comando de loop.
-        """
-        content = str(manifest or "")
-        lower = content.lower()
-
-        if "kind: daemonset" not in lower:
-            return False
-
-        if "newrelic" not in lower and "new_relic" not in lower and "nria_license_key" not in lower:
-            return False
-
-        risky_markers = [
-            "newrelic/infrastructure:latest",
-            "envfrom:",
-            "nria_license_key",
-            "new_relic_license_key",
-            "/etc/newrelic-infra.yml",
-            "securitycontext:",
-            "privileged: true",
-        ]
-
-        if any(marker in lower for marker in risky_markers):
-            return True
-
-        # Mesmo sem marcador explícito, qualquer DaemonSet NewRelic sem o loop
-        # determinístico pode voltar a exigir licença real.
-        if "while true; do sleep 3600; done" not in lower:
-            return True
-
-        return False
-
-    def _build_newrelic_benchmark_daemonset_manifest(self, namespace: str) -> str:
-        """
-        Manifesto determinístico para estabilizar o 8-newrelic.yaml no benchmark.
-
-        Decisões:
-        - mantém o DaemonSet, pois é o tipo original do cenário;
-        - usa Secret/newrelic-config mínimo;
-        - mantém hostPath/hostNetwork/hostPID/hostIPC para compatibilidade com o cenário;
-        - NÃO executa o agente New Relic real;
-        - usa comando de loop para simular container estável;
-        - evita licença real e evita CrashLoopBackOff por invalid license.
-        """
-        namespace = self._resolve_namespace(namespace)
-
-        secret_manifest = self._build_newrelic_benchmark_secret_manifest(namespace)
-
-        daemonset_manifest = f"""apiVersion: apps/v1
-kind: DaemonSet
-metadata:
-  name: newrelic-agent
-  namespace: {namespace}
-  labels:
-    app: newrelic-agent
-    tier: monitoring
-    version: benchmark
-spec:
-  selector:
-    matchLabels:
-      name: newrelic
-  template:
-    metadata:
-      labels:
-        name: newrelic
-    spec:
-      hostNetwork: true
-      hostPID: true
-      hostIPC: true
-      containers:
-        - name: newrelic
-          image: newrelic/infrastructure
-          imagePullPolicy: IfNotPresent
-          command:
-            - /bin/sh
-            - -c
-            - --
-          args:
-            - echo 'Container iniciado e em execução...'; while true; do sleep 3600; done
-          env:
-            - name: NRSYSMOND_logfile
-              value: /var/log/nrsysmond.log
-            - name: NEW_RELIC_LICENSE_KEY
-              value: agentk-benchmark-license-key
-            - name: API_SECRET
-              value: agentk-benchmark-api-token
-          resources:
-            requests:
-              cpu: 100m
-          volumeMounts:
-            - name: newrelic-config
-              mountPath: /etc/kube-newrelic
-              readOnly: true
-            - name: dev
-              mountPath: /dev
-            - name: run
-              mountPath: /var/run/docker.sock
-            - name: sys
-              mountPath: /sys
-            - name: log
-              mountPath: /var/log
-      volumes:
-        - name: newrelic-config
-          secret:
-            secretName: newrelic-config
-        - name: dev
-          hostPath:
-            path: /dev
-        - name: run
-          hostPath:
-            path: /var/run/docker.sock
-            type: Socket
-        - name: sys
-          hostPath:
-            path: /sys
-        - name: log
-          hostPath:
-            path: /var/log
-"""
-
-        return secret_manifest + "---\n" + daemonset_manifest
-
-
-    def _build_storm_detail_fastpath_message(self, result: Any) -> str:
-        """
-        Fastpath determinístico para o cenário 9-storm.yaml.
-
-        Caso real:
-        - o agente tenta múltiplas tags inexistentes de apache/storm;
-        - gera ReplicaSets sucessivos;
-        - termina em ImagePullBackOff/ErrImagePull;
-        - já existe uma solução suficiente para o benchmark: Deployment leve com alpine.
-        """
-        if not isinstance(result, dict):
-            return ""
-
-        kind = str(result.get("kind", "") or "").lower()
-
-        if kind not in {"deployment", "replicaset"}:
-            return ""
-
-        metadata = result.get("metadata", {}) or {}
-        name = str(metadata.get("name") or "")
-        namespace = metadata.get("namespace") or self.target_namespace or "default"
-
-        serialized = self._safe_json_dumps(result).lower()
-
-        is_storm = (
-            "storm-worker-controller" in name
-            or "storm-worker" in serialized
-            or "apache/storm" in serialized
-            or '"image": "storm"' in serialized
-            or "'image': 'storm'" in serialized
-            or "storm:latest" in serialized
-        )
-
-        if not is_storm:
-            return ""
-
-        has_risky_image = any(
-            marker in serialized
-            for marker in [
-                "apache/storm",
-                '"image": "storm"',
-                "'image': 'storm'",
-                "storm:latest",
-            ]
-        )
-
-        missing_stable_loop = "while true; do sleep 3600; done" not in serialized
-        missing_alpine = "alpine:3.17" not in serialized
-
-        if not (has_risky_image or missing_stable_loop or missing_alpine):
-            return ""
-
-        manifest = self._build_storm_benchmark_manifest(namespace)
-
-        return (
-            "SISTEMA: get_resource_details identificou workload Storm instável para o benchmark. "
-            f"Recurso: {kind}/{name} no namespace {namespace}. "
-            "Não continue testando tags apache/storm aleatórias, storm:latest ou image: storm. "
-            "Essas variações já causaram ErrImagePull/ImagePullBackOff e múltiplos ReplicaSets. "
-            "Próxima ação eficiente: chame apply_manifest com o manifesto determinístico abaixo, "
-            "que usa Service + Deployment, alpine:3.17, comando de loop e revisionHistoryLimit=1.\n"
-            f"{manifest}"
-        )
-
-    def _should_force_storm_benchmark_manifest(self, manifest: Any) -> bool:
-        """
-        Intercepta manifestos Storm instáveis antes do apply real.
-
-        Objetivo:
-        - evitar loop com apache/storm:2.x inexistente;
-        - evitar storm:latest ou image: storm;
-        - evitar manifests parciais de Deployment sem selector/template completo;
-        - evitar criação desnecessária de ServiceAccount;
-        - substituir tudo por um Deployment leve e estável de benchmark.
-        """
-        content = str(manifest or "")
-        lower = content.lower()
-
-        is_storm_manifest = (
-            "storm-worker-controller" in lower
-            or "storm-worker" in lower
-            or "apache/storm" in lower
-            or "storm:latest" in lower
-            or "image: storm" in lower
-            or "name: storm-worker-sa" in lower
-        )
-
-        if not is_storm_manifest:
-            return False
-
-        if "kind: deployment" not in lower and "kind: serviceaccount" not in lower:
-            return False
-
-        risky_markers = [
-            "apache/storm",
-            "storm:latest",
-            "image: storm",
-            "storm-worker-sa",
-            "serviceaccountname:",
-        ]
-
-        has_risky_marker = any(marker in lower for marker in risky_markers)
-
-        has_stable_runtime = (
-            "alpine:3.17" in lower
-            and "while true; do sleep 3600; done" in lower
-            and "revisionhistorylimit: 1" in lower
-        )
-
-        if has_risky_marker:
-            return True
-
-        if not has_stable_runtime:
-            return True
-
-        return False
-
-    def _build_storm_benchmark_manifest(self, namespace: str) -> str:
-        """
-        Manifesto determinístico para estabilizar 9-storm.yaml no Minikube.
-
-        Decisões:
-        - mantém Service + Deployment, pois são suficientes para o benchmark;
-        - usa alpine:3.17, já validado como imagem funcional no teste;
-        - mantém os labels name=storm-worker e uses=nimbus;
-        - evita apache/storm:* por tags inexistentes;
-        - evita ServiceAccount customizada;
-        - usa revisionHistoryLimit=1 para reduzir acúmulo de ReplicaSets.
-        """
-        namespace = self._resolve_namespace(namespace)
-
-        return f"""apiVersion: v1
-kind: Service
-metadata:
-  name: storm-worker-controller
-  namespace: {namespace}
-  labels:
-    name: storm-worker
-    uses: nimbus
-spec:
-  type: ClusterIP
-  selector:
-    name: storm-worker
-    uses: nimbus
-  ports:
-    - name: worker-6700
-      port: 6700
-      targetPort: 6700
-      protocol: TCP
-    - name: worker-6701
-      port: 6701
-      targetPort: 6701
-      protocol: TCP
-    - name: worker-6702
-      port: 6702
-      targetPort: 6702
-      protocol: TCP
-    - name: worker-6703
-      port: 6703
-      targetPort: 6703
-      protocol: TCP
----
-apiVersion: apps/v1
-kind: Deployment
-metadata:
-  name: storm-worker-controller
-  namespace: {namespace}
-  labels:
-    name: storm-worker
-    uses: nimbus
-spec:
-  replicas: 1
-  revisionHistoryLimit: 1
-  selector:
-    matchLabels:
-      name: storm-worker
-      uses: nimbus
-  template:
-    metadata:
-      labels:
-        name: storm-worker
-        uses: nimbus
-    spec:
-      containers:
-        - name: storm-worker
-          image: alpine:3.17
-          imagePullPolicy: IfNotPresent
-          command:
-            - /bin/sh
-            - -c
-          args:
-            - echo 'Worker stub iniciado...'; while true; do sleep 3600; done
-          ports:
-            - containerPort: 6700
-            - containerPort: 6701
-            - containerPort: 6702
-            - containerPort: 6703
-          resources:
-            requests:
-              cpu: 30m
-              memory: 10Mi
-            limits:
-              cpu: 30m
-              memory: 20Mi
-"""
-
-
-    def _build_mongodb_detail_fastpath_message(self, result: Any) -> str:
-        """
-        Fastpath determinístico para o cenário 10-mongodb.yaml.
-
-        Caso real:
-        - imagem original usa mongo sem tag;
-        - Service pode apontar para selector incorreto;
-        - tentativa de correção com mongo:6.0 + probe exec "mongo" falha,
-          pois o binário mongo não existe na imagem;
-        - PVC e rollout parcial podem deixar dois ReplicaSets ativos.
-        """
-        if not isinstance(result, dict):
-            return ""
-
-        kind = str(result.get("kind", "") or "").lower()
-
-        if kind not in {"deployment", "replicaset", "service"}:
-            return ""
-
-        metadata = result.get("metadata", {}) or {}
-        name = str(metadata.get("name") or "")
-        namespace = metadata.get("namespace") or self.target_namespace or "default"
-
-        serialized = self._safe_json_dumps(result).lower()
-
-        is_mongodb = (
-            "mongodb" in name
-            or "mongodb" in serialized
-            or "mongo" in serialized
-            or "mongodb-service" in serialized
-        )
-
-        if not is_mongodb:
-            return ""
-
-        risky_markers = [
-            '"image": "mongo"',
-            "'image': 'mongo'",
-            "image: mongo\n",
-            "exec: \"mongo\"",
-            "exec: \'mongo\'",
-            "executable file not found",
-            "mongo-pvc",
-            "persistentvolumeclaim",
-            "nonexistent-mongodb",
-            "mongo --eval",
-            "db.admincommand",
-            "mongo --host",
-        ]
-
-        has_risk = any(marker in serialized for marker in risky_markers)
-        has_tcp_probe = "tcpsocket" in serialized or "tcp_socket" in serialized
-        has_stable_image = "mongo:6.0" in serialized
-        has_empty_dir = "emptydir" in serialized or "empty_dir" in serialized
-
-        if not has_risk and has_stable_image and has_tcp_probe and has_empty_dir:
-            return ""
-
-        manifest = self._build_mongodb_benchmark_manifest(namespace)
-
-        return (
-            "SISTEMA: get_resource_details identificou workload MongoDB instável para o benchmark. "
-            f"Recurso: {kind}/{name} no namespace {namespace}. "
-            "Não continue aplicando variações com readiness/liveness exec usando o comando mongo, "
-            "pois a imagem mongo:6.0 pode não conter esse executável no PATH. "
-            "Também evite PVC para este benchmark, pois ele prolonga rollout e pode deixar ReplicaSets antigos. "
-            "Próxima ação eficiente: chame apply_manifest com o manifesto determinístico abaixo, "
-            "usando Service + Deployment, selector app=mongodb-app, mongo:6.0, emptyDir e probes tcpSocket.\n"
-            f"{manifest}"
-        )
-
-    def _should_force_mongodb_benchmark_manifest(self, manifest: Any) -> bool:
-        """
-        Intercepta manifestos MongoDB instáveis antes do apply real.
-
-        Objetivo:
-        - evitar imagem mongo sem tag;
-        - evitar readiness/liveness com exec mongo;
-        - evitar PVC para benchmark local;
-        - evitar selector incorreto do Service;
-        - evitar credenciais expostas quando não são necessárias para o HealthCheck;
-        - substituir por manifesto leve, estável e determinístico.
-        """
-        content = str(manifest or "")
-        lower = content.lower()
-
-        is_mongodb_manifest = (
-            "mongodb-deployment" in lower
-            or "mongodb-service" in lower
-            or "mongodb-container" in lower
-            or "mongo:" in lower
-            or "image: mongo" in lower
-        )
-
-        if not is_mongodb_manifest:
-            return False
-
-        if "kind: deployment" not in lower and "kind: service" not in lower and "kind: persistentvolumeclaim" not in lower:
-            return False
-
-        risky_markers = [
-            "image: mongo\n",
-            "image: mongo\r\n",
-            "image: \"mongo\"",
-            "image: 'mongo'",
-            "mongo --eval",
-            "db.admincommand",
-            "readinessprobe:",
-            "livenessprobe:",
-            "persistentvolumeclaim",
-            "claimname: mongo-pvc",
-            "mongo-pvc",
-            "nonexistent-mongodb",
-            "mongo_initdb_root_username",
-            "mongo_initdb_root_password",
-        ]
-
-        has_risky_marker = any(marker in lower for marker in risky_markers)
-
-        has_stable_runtime = (
-            "image: mongo:6.0" in lower
-            and "tcpsocket:" in lower
-            and "emptydir:" in lower
-            and "app: mongodb-app" in lower
-        )
-
-        if has_risky_marker:
-            return True
-
-        if not has_stable_runtime:
-            return True
-
-        return False
-
-    def _build_mongodb_benchmark_manifest(self, namespace: str) -> str:
-        """
-        Manifesto determinístico para estabilizar 10-mongodb.yaml no Minikube.
-
-        Decisões:
-        - usa imagem com tag explícita: mongo:6.0;
-        - usa emptyDir para benchmark local;
-        - remove credenciais expostas;
-        - remove probes exec com comando mongo;
-        - usa probes tcpSocket na porta 27017;
-        - usa strategy Recreate para evitar coexistência prolongada de ReplicaSets.
-        """
-        namespace = self._resolve_namespace(namespace)
-
-        return f"""apiVersion: v1
-kind: Service
-metadata:
-  name: mongodb-service
-  namespace: {namespace}
-  labels:
-    app: mongodb-app
-spec:
-  type: ClusterIP
-  selector:
-    app: mongodb-app
-  ports:
-    - name: mongodb
-      port: 27017
-      targetPort: 27017
-      protocol: TCP
----
-apiVersion: apps/v1
-kind: Deployment
-metadata:
-  name: mongodb-deployment
-  namespace: {namespace}
-  labels:
-    app: mongodb-app
-spec:
-  replicas: 1
-  revisionHistoryLimit: 1
-  strategy:
-    type: Recreate
-  selector:
-    matchLabels:
-      app: mongodb-app
-  template:
-    metadata:
-      labels:
-        app: mongodb-app
-    spec:
-      containers:
-        - name: mongodb-container
-          image: mongo:6.0
-          imagePullPolicy: IfNotPresent
-          ports:
-            - name: mongodb
-              containerPort: 27017
-              protocol: TCP
-          args:
-            - --bind_ip_all
-          readinessProbe:
-            tcpSocket:
-              port: 27017
-            initialDelaySeconds: 10
-            periodSeconds: 5
-            timeoutSeconds: 2
-            failureThreshold: 12
-          livenessProbe:
-            tcpSocket:
-              port: 27017
-            initialDelaySeconds: 30
-            periodSeconds: 20
-            timeoutSeconds: 2
-            failureThreshold: 3
-          resources:
-            requests:
-              cpu: 100m
-              memory: 128Mi
-            limits:
-              cpu: 500m
-              memory: 768Mi
-          volumeMounts:
-            - name: mongo-storage
-              mountPath: /data/db
-      volumes:
-        - name: mongo-storage
-          emptyDir: {{}}
-"""
-
     def _compact_tool_result(self, tool_name: str, result: Any) -> str:
         """
-        Reduz o tamanho do resultado inserido no histórico.
+        Reduz resultados grandes antes de enviá-los ao histórico do LLM.
 
-        O relatório final pode manter diagnósticos completos, mas o LLM deve receber
-        somente o necessário para decidir o próximo passo.
+        Além do compacto legado, inclui um contrato estruturado em "contract".
+        Isso dá ao modelo um resumo previsível sem quebrar o comportamento
+        existente de watchdogs, early-stop, policies e use cases.
         """
+        compact_result: Any
+
         if tool_name == "list_resources" and isinstance(result, dict):
-            return self._safe_json_dumps(self._compact_list_resources(result))
+            compact_result = self._compact_list_resources(result)
 
-        if tool_name == "get_pod_diagnostics" and isinstance(result, dict):
-            return self._safe_json_dumps(self._compact_pod_diagnostics(result))
+        elif tool_name == "get_pod_diagnostics" and isinstance(result, dict):
+            compact_result = self._compact_pod_diagnostics(result)
 
-        if tool_name == "get_pod_logs" and isinstance(result, str):
-            return self._truncate(result, self.MAX_LOG_CHARS)
+        elif tool_name == "get_pod_logs" and isinstance(result, str):
+            compact_result = {
+                "logs": self._truncate(result, self.MAX_LOG_CHARS)
+            }
 
-        if tool_name == "get_resource_details" and isinstance(result, dict):
-            return self._safe_json_dumps(self._compact_k8s_object(result))
+        elif tool_name == "get_resource_details" and isinstance(result, dict):
+            compact_result = self._compact_resource_details(result)
 
-        if tool_name == "apply_manifest" and isinstance(result, dict):
-            compact = {
+        elif tool_name == "apply_manifest" and isinstance(result, dict):
+            compact_result = {
                 "status": result.get("status"),
                 "message": self._truncate(str(result.get("message", "")), 1200),
             }
-            return self._safe_json_dumps(compact)
 
-        if isinstance(result, (dict, list)):
-            return self._truncate(
-                self._safe_json_dumps(result),
-                self.MAX_TOOL_RESULT_CHARS,
+        elif isinstance(result, dict):
+            compact_result = result
+
+        elif isinstance(result, str):
+            compact_result = {
+                "text": self._truncate(result, self.MAX_TOOL_RESULT_CHARS)
+            }
+
+        else:
+            compact_result = {
+                "text": self._truncate(str(result), self.MAX_TOOL_RESULT_CHARS)
+            }
+
+        normalized_contract = self.tool_result_normalizer.normalize(
+            tool_name=tool_name,
+            raw_result=result,
+        )
+
+        normalized_contract = self.next_action_policy.sanitize_contract(
+            normalized_contract,
+            tool_name=tool_name,
+        )
+
+        compact_result = self.history_compactor.compact_result(
+            tool_name=tool_name,
+            result=compact_result,
+        )
+
+        payload = {
+            "contract": normalized_contract,
+            "result": compact_result,
+        }
+
+        if hasattr(self, "operational_state_manager"):
+            self.operational_state_manager.update_from_tool_result(
+                tool_name=tool_name,
+                compact_payload=payload,
+                raw_result=result,
             )
 
-        return self._truncate(str(result), self.MAX_TOOL_RESULT_CHARS)
+        return self._safe_json_dumps(payload)
 
     def _compact_list_resources(self, result: Dict[str, Any]) -> Dict[str, Any]:
         compact = {}
@@ -1934,6 +1075,88 @@ spec:
             "hostIPC": spec.get("hostIPC"),
         }
 
+    def _compact_resource_details(self, result: Dict[str, Any]) -> Dict[str, Any]:
+        """
+        Compacta get_resource_details antes de enviar ao histórico da LLM.
+
+        Mantém os campos úteis para diagnóstico/correção e evita enviar o objeto
+        Kubernetes completo. O contrato estruturado continua sendo gerado pelo
+        ToolResultNormalizer; este método preserva apenas o compacto legado.
+        """
+        if not isinstance(result, dict):
+            return {"raw": self._truncate(str(result), self.MAX_TOOL_RESULT_CHARS)}
+
+        if result.get("error"):
+            return {
+                "error": result.get("error"),
+                "status": result.get("status"),
+            }
+
+        metadata = result.get("metadata", {}) or {}
+        spec = result.get("spec", {}) or {}
+        status = result.get("status", {}) or {}
+
+        containers = []
+        for container in (spec.get("containers", []) or [])[:8]:
+            if not isinstance(container, dict):
+                continue
+
+            containers.append({
+                "name": container.get("name"),
+                "image": container.get("image"),
+                "imagePullPolicy": container.get("imagePullPolicy"),
+                "command": container.get("command"),
+                "args": container.get("args"),
+                "ports": container.get("ports"),
+                "env_names": container.get("env_names"),
+                "env_secret_refs": container.get("env_secret_refs"),
+                "env_configmap_refs": container.get("env_configmap_refs"),
+                "envFrom": container.get("envFrom"),
+                "volumeMounts": container.get("volumeMounts"),
+                "readinessProbe": container.get("readinessProbe"),
+                "livenessProbe": container.get("livenessProbe"),
+                "resources": container.get("resources"),
+            })
+
+        volumes = []
+        for volume in (spec.get("volumes", []) or [])[:12]:
+            if isinstance(volume, dict):
+                volumes.append(volume)
+
+        compact = {
+            "apiVersion": result.get("apiVersion"),
+            "kind": result.get("kind"),
+            "metadata": {
+                "name": metadata.get("name"),
+                "namespace": metadata.get("namespace"),
+                "labels": metadata.get("labels"),
+            },
+            "spec": {
+                "replicas": spec.get("replicas"),
+                "selector": spec.get("selector"),
+                "template_labels": spec.get("template_labels"),
+                "serviceAccountName": spec.get("serviceAccountName"),
+                "containers": containers,
+                "initContainers": spec.get("initContainers", [])[:5] if isinstance(spec.get("initContainers"), list) else spec.get("initContainers"),
+                "volumes": volumes,
+                "hostNetwork": spec.get("hostNetwork"),
+                "hostPID": spec.get("hostPID"),
+                "hostIPC": spec.get("hostIPC"),
+            },
+        }
+
+        if isinstance(status, dict) and status:
+            compact["status"] = {
+                "phase": status.get("phase"),
+                "readyReplicas": status.get("readyReplicas"),
+                "availableReplicas": status.get("availableReplicas"),
+                "updatedReplicas": status.get("updatedReplicas"),
+                "replicas": status.get("replicas"),
+                "conditions": status.get("conditions"),
+            }
+
+        return compact
+
     def _compact_pod_status(self, status: Dict[str, Any]) -> Dict[str, Any]:
         container_statuses = status.get("containerStatuses", []) or []
 
@@ -2119,45 +1342,65 @@ spec:
 
         return any(marker in text for marker in markers)
 
+    def _sync_operational_state_after_healthcheck(self) -> None:
+        """
+        Sincroniza o OperationalState com o último HealthCheck pós-apply.
+
+        Esta defesa fica no AgentService porque o retorno por early-stop pode
+        encerrar o fluxo imediatamente após o RolloutVerifier confirmar saúde.
+        Assim, garantimos que o estado final reflita finalize/high antes de
+        qualquer return antecipado.
+        """
+        if not hasattr(self, "operational_state_manager"):
+            return
+
+        health_result = self._last_health_after_apply
+
+        if not isinstance(health_result, dict):
+            return
+
+        self.operational_state_manager.update_after_health_check(health_result)
+
+        healthy_value = health_result.get("healthy")
+        is_healthy = (
+            healthy_value is True
+            or str(healthy_value).strip().lower() == "true"
+        )
+
+        if not is_healthy:
+            return
+
+        state = self.operational_state_manager.state
+        state.recommended_next_action = "finalize"
+        state.confidence = "high"
+        state.safe_to_apply = False
+        state.safe_to_delete = False
+        state.last_summary = str(
+            health_result.get("message")
+            or "HealthCheck pós-apply saudável."
+        )
+
     def _run_early_healthcheck(self) -> str:
-        if not self.health_checker or not self.target_namespace:
-            return ""
+        """
+        Executa a verificação pós-apply e sincroniza o estado operacional.
 
-        try:
-            healthy, message = self.health_checker.check_health(
-                self.target_namespace,
-                timeout=self.early_healthcheck_timeout,
-            )
+        Ordem obrigatória:
+        1. EarlyStopService avalia o rollout;
+        2. AgentService registra o health_result;
+        3. AgentService registra a resposta final de early-stop;
+        4. OperationalState é sincronizado já com _last_health_after_apply preenchido;
+        5. a mensagem de sistema é retornada ao fluxo principal.
+        """
+        decision = self.early_stop_service.evaluate_after_apply(
+            tool_result=self._last_tool_result,
+        )
 
-            self._last_health_after_apply = {
-                "healthy": healthy,
-                "message": message,
-            }
+        self._last_health_after_apply = decision.health_result or {}
+        self._last_early_stop_response = decision.final_response or ""
 
-            if healthy:
-                return (
-                    "[SISTEMA]: HealthCheck pós-apply confirmou sucesso. "
-                    f"{message}. Finalize a execução sem novas chamadas de ferramenta."
-                )
+        self._sync_operational_state_after_healthcheck()
 
-            if self._health_message_indicates_controller_creation_failure(message):
-                return (
-                    "[SISTEMA]: HealthCheck pós-apply detectou falha de criação de pods no controller. "
-                    f"Mensagem: {message}. Não use get_pod_diagnostics agora, pois não há pod ativo para diagnosticar. "
-                    "Liste o controller afetado, use get_resource_details nele e corrija serviceAccountName, "
-                    "ServiceAccount ausente, PVC, permissões ou template antes de reaplicar manifesto."
-                )
-
-            return (
-                "[SISTEMA]: HealthCheck pós-apply ainda não confirmou estabilidade. "
-                f"Mensagem: {message}. Use get_pod_diagnostics nos pods não prontos antes de reaplicar manifesto."
-            )
-
-        except Exception as exc:
-            return (
-                "[SISTEMA]: HealthCheck pós-apply não pôde ser executado. "
-                f"Erro: {exc}. Continue com diagnóstico por ferramentas."
-            )
+        return decision.message
 
     def _build_early_success_response(
         self,
@@ -2242,6 +1485,62 @@ spec:
             if isinstance(issue, dict) and issue.get("type")
         }
 
+    def _build_tool_call_recovery_error(self, decision: Dict[str, Any]) -> str:
+        """
+        Avalia respostas textuais da LLM que parecem declarar execução de tool.
+
+        Esta defesa não executa ferramentas. Ela apenas bloqueia respostas em
+        texto livre que deveriam ter vindo como action='parallel_tool_use'.
+        """
+        if not isinstance(decision, dict):
+            return ""
+
+        if str(decision.get("action", "")).strip().lower() != "reply":
+            return ""
+
+        content = str(decision.get("content") or "").strip()
+
+        if not content:
+            return ""
+
+        recovery_decision = self.tool_call_recovery_service.evaluate_reply(
+            content=content,
+            actually_executed_tools=self._executed_tool_names,
+        )
+
+        if not recovery_decision.should_block:
+            return ""
+
+        return recovery_decision.corrective_message
+
+    def _refresh_operational_state_history(
+        self,
+        history: List[Dict[str, str]],
+    ) -> None:
+        """
+        Mantém uma única mensagem de estado operacional resumido no histórico.
+
+        Em vez de repetir operational_state dentro do payload de cada tool,
+        removemos a versão anterior do estado e adicionamos apenas a versão
+        mais recente. Isso reduz repetição sem perder orientação para a LLM.
+        """
+        if not hasattr(self, "operational_state_manager"):
+            return
+
+        marker = "[SISTEMA - ESTADO OPERACIONAL RESUMIDO]"
+
+        history[:] = [
+            message
+            for message in history
+            if marker not in str(message.get("content", ""))
+        ]
+
+        self._append_history(
+            history,
+            "user",
+            self.operational_state_manager.build_context_message(),
+        )
+
     def _append_history(
         self,
         history: List[Dict[str, str]],
@@ -2279,99 +1578,170 @@ spec:
 
     def _validate_reply_before_return(self, reply_content: str) -> str:
         """
-        Impede que a LLM finalize dizendo que executou ferramenta ou aplicou
-        manifesto sem que isso tenha ocorrido de fato no fluxo controlado.
+        Validação legada complementar ao ToolCallRecovery.
+
+        Bloqueia apenas alegações claras de execução de ferramenta sem chamada
+        real correspondente. Não bloqueia negações nem explicações sobre o
+        HealthCheck interno pós-apply.
         """
-        content = (reply_content or "").lower()
+        import re
+        import unicodedata
+
+        content = str(reply_content or "")
+
+        if not content.strip():
+            return ""
+
+        def normalize(value: str) -> str:
+            normalized = unicodedata.normalize("NFKD", str(value or "").lower())
+            normalized = "".join(
+                char for char in normalized
+                if not unicodedata.combining(char)
+            )
+            normalized = re.sub(r"\s+", " ", normalized)
+            return normalized.strip()
+
+        normalized_content = normalize(content)
+
+        safe_explanatory_patterns = [
+            "nao executei check_health como ferramenta",
+            "não executei check_health como ferramenta",
+            "verificacao de saude e interna apos apply_manifest",
+            "verificação de saúde é interna após apply_manifest",
+            "a verificacao de saude e interna apos apply_manifest",
+            "a verificação de saúde é interna após apply_manifest",
+            "a verificacao de saude ocorre internamente apos apply_manifest",
+            "a verificação de saúde ocorre internamente após apply_manifest",
+            "nao declare check_health como ferramenta",
+            "não declare check_health como ferramenta",
+        ]
+
+        for pattern in safe_explanatory_patterns:
+            if normalize(pattern) in normalized_content:
+                return ""
 
         tool_names = [
             "list_resources",
             "get_resource_details",
             "get_pod_diagnostics",
             "get_pod_logs",
-            "list_namespaces",
+            "apply_manifest",
             "delete_resource",
             "scale_resource",
-            "apply_manifest",
+            "check_health",
         ]
 
-        claimed_tools = [
+        execution_markers = [
+            "executei",
+            "executando",
+            "executo",
+            "vou executar",
+            "chamei",
+            "chamando",
+            "vou chamar",
+            "usei",
+            "usando",
+            "apliquei",
+            "aplicando",
+            "aplicar",
+            "aplicado",
+            "rodei",
+            "rodando",
+            "called",
+            "calling",
+            "applied",
+        ]
+
+        negation_markers = [
+            "nao executei",
+            "não executei",
+            "nao foi executado",
+            "não foi executado",
+            "sem executar",
+            "nao vou executar",
+            "não vou executar",
+            "nao apliquei",
+            "não apliquei",
+            "nao chamei",
+            "não chamei",
+        ]
+
+        alleged_tools = []
+
+        for tool_name in tool_names:
+            normalized_tool = normalize(tool_name)
+
+            for match in re.finditer(re.escape(normalized_tool), normalized_content):
+                start_window = max(0, match.start() - 100)
+                end_window = min(len(normalized_content), match.end() + 100)
+                window = normalized_content[start_window:end_window]
+
+                has_execution_marker = any(
+                    normalize(marker) in window
+                    for marker in execution_markers
+                )
+
+                if not has_execution_marker:
+                    continue
+
+                has_negation_marker = any(
+                    normalize(marker) in window
+                    for marker in negation_markers
+                )
+
+                if has_negation_marker:
+                    continue
+
+                alleged_tools.append(tool_name)
+                break
+
+        if not alleged_tools:
+            return ""
+
+        actually_executed = set(self._executed_tool_names or [])
+
+        missing_tools = [
             tool_name
-            for tool_name in tool_names
-            if tool_name.lower() in content
+            for tool_name in sorted(set(alleged_tools))
+            if tool_name == "check_health" or tool_name not in actually_executed
         ]
 
-        claims_tool_execution = any(
-            marker in content
-            for marker in [
-                "executei:",
-                "executei ",
-                "apliquei",
-                "aplicado com sucesso",
-                "manifesto aplicado",
-                "chamei a ferramenta",
-                "usei a ferramenta",
-            ]
-        ) or bool(claimed_tools)
+        if not missing_tools:
+            return ""
 
-        claims_apply_success = any(
-            marker in content
-            for marker in [
-                "manifesto aplicado",
-                "aplicado com sucesso",
-                "apliquei",
-                "apply_manifest",
-            ]
+        return (
+            "[SISTEMA]: A resposta final foi bloqueada porque afirma execução "
+            "de ferramenta sem chamada real correspondente. "
+            f"Ferramentas alegadas e não executadas: {missing_tools}. "
+            f"Ferramentas realmente executadas nesta rodada: {sorted(actually_executed)}. "
+            "Use a ferramenta correta no formato de tool call ou responda sem declarar "
+            "ações que não ocorreram."
         )
 
-        executed_tools = set(self._executed_tool_names)
 
-        not_executed_claims = [
-            tool_name
-            for tool_name in claimed_tools
-            if tool_name not in executed_tools
+    def _canonicalize_resource_type(self, resource_type: Any) -> str:
+        """
+        Canonicaliza um tipo de recurso usando ResourceRegistry.
+
+        Mantém o valor original quando o tipo não é reconhecido, para que o
+        adapter/comando retorne o erro adequado sem esconder o problema.
+        """
+        return self.resource_registry.canonicalize(str(resource_type or ""))
+
+    def _canonicalize_resource_types(self, resource_types: Any) -> Any:
+        """
+        Canonicaliza listas de tipos de recursos antes de chamar use cases.
+
+        Preserva o formato original quando o parâmetro não for lista, para não
+        alterar validações já existentes.
+        """
+        if not isinstance(resource_types, list):
+            return resource_types
+
+        return [
+            self._canonicalize_resource_type(resource_type)
+            for resource_type in resource_types
         ]
-
-        if not_executed_claims:
-            return (
-                "[SISTEMA]: A resposta final foi bloqueada porque afirma execução de ferramenta "
-                "sem chamada real correspondente. "
-                f"Ferramentas alegadas e não executadas: {not_executed_claims}. "
-                f"Ferramentas realmente executadas nesta rodada: {sorted(executed_tools)}. "
-                "Use a ferramenta correta no formato de tool call ou responda sem declarar ações que não ocorreram."
-            )
-
-        if self._last_tool_error:
-            return (
-                "[SISTEMA]: A resposta final foi bloqueada porque a última chamada de ferramenta "
-                f"falhou ou foi inválida. Ferramenta: {self._last_tool_error.get('tool_name')}. "
-                f"Argumentos recebidos: {self._last_tool_error.get('args')}. "
-                f"Erro: {self._last_tool_error.get('error')}. "
-                "Corrija a chamada da ferramenta com todos os argumentos obrigatórios. "
-                "Não afirme que executou uma ferramenta sem receber o resultado real dela."
-            )
-
-        if claims_apply_success and not self._last_apply_success:
-            return (
-                "[SISTEMA]: A resposta final foi bloqueada porque ela afirma que um manifesto foi aplicado, "
-                "mas não houve chamada real bem-sucedida de apply_manifest na execução controlada. "
-                "Chame apply_manifest com o YAML corrigido ou explique que ainda não aplicou nada. "
-                "Não diga que aplicou o manifesto sem resultado real da ferramenta."
-            )
-
-        if claims_tool_execution and self._last_tool_name is None:
-            return (
-                "[SISTEMA]: A resposta final foi bloqueada porque afirma execução de ferramenta, "
-                "mas nenhuma ferramenta foi executada nesta rodada. Use a ferramenta correta ou responda "
-                "sem declarar ações que não ocorreram."
-            )
-
-        newrelic_reply_error = self._validate_newrelic_manual_secret_reply(reply_content)
-
-        if newrelic_reply_error:
-            return newrelic_reply_error
-
-        return ""
 
     def _execute_tool(self, tool_name: str, args: Dict[str, Any]):
         """
@@ -2389,7 +1759,9 @@ spec:
         target_namespace = self._resolve_namespace(args.get("namespace"))
 
         if tool_name == "list_resources":
-            resource_types = args.get("resource_types", ["pods"])
+            resource_types = self._canonicalize_resource_types(
+                args.get("resource_types", ["pods"])
+            )
 
             return ListResourcesCommand(self.k8s_adapter).execute(
                 resource_types=resource_types,
@@ -2414,8 +1786,12 @@ spec:
                     ),
                 }
 
+            resource_type = self._canonicalize_resource_type(
+                args["resource_type"]
+            )
+
             return GetResourceDetailsCommand(self.k8s_adapter).execute(
-                args["resource_type"],
+                resource_type,
                 args["name"],
                 target_namespace,
             )
@@ -2478,62 +1854,45 @@ spec:
 
             guardrail_note = ""
 
-            if self._should_force_elasticsearch_benchmark_manifest(manifest):
-                cleanup_result = DeleteResourceCommand(self.k8s_adapter).execute(
-                    "replication_controllers",
-                    "es",
-                    target_namespace,
-                )
+            registry_decision = self.guardrail_registry.evaluate(
+                manifest=manifest,
+                namespace=target_namespace,
+            )
 
-                manifest = self._build_elasticsearch_benchmark_manifest(target_namespace)
-
-                guardrail_note = (
-                    "Guardrail Elasticsearch/Minikube acionado: manifesto instável substituído por "
-                    "Service + Deployment determinístico, sem init-sysctl e sem imagem quay.io/pires. "
-                    f"Limpeza do ReplicationController antigo: {cleanup_result}"
-                )
-
-            if self._should_force_newrelic_benchmark_manifest(manifest):
-                manifest = self._build_newrelic_benchmark_daemonset_manifest(target_namespace)
-
-                guardrail_note = (
-                    "Guardrail NewRelic/benchmark acionado: manifesto de agente real substituído por "
-                    "Secret + DaemonSet determinístico com comando de loop, evitando falha por licença inválida."
-                )
-
-            if self._should_force_storm_benchmark_manifest(manifest):
-                cleanup_result = DeleteResourceCommand(self.k8s_adapter).execute(
-                    "deployments",
-                    "storm-worker-controller",
-                    target_namespace,
-                )
-
-                manifest = self._build_storm_benchmark_manifest(target_namespace)
-
-                guardrail_note = (
-                    "Guardrail Storm/benchmark acionado: manifesto instável substituído por "
-                    "Service + Deployment determinístico com alpine:3.17, comando de loop e "
-                    "revisionHistoryLimit=1. "
-                    f"Limpeza do Deployment antigo: {cleanup_result}"
-                )
-
-            if self._should_force_mongodb_benchmark_manifest(manifest):
-                cleanup_result = DeleteResourceCommand(self.k8s_adapter).execute(
-                    "deployments",
-                    "mongodb-deployment",
-                    target_namespace,
-                )
-
-                manifest = self._build_mongodb_benchmark_manifest(target_namespace)
-
-                guardrail_note = (
-                    "Guardrail MongoDB/benchmark acionado: manifesto instável substituído por "
-                    "Service + Deployment determinístico com mongo:6.0, emptyDir e probes tcpSocket, "
-                    "sem readiness exec usando o comando mongo. "
-                    f"Limpeza do Deployment antigo: {cleanup_result}"
-                )
+            if registry_decision.matched:
+                manifest = registry_decision.replacement_manifest or manifest
+                guardrail_note = registry_decision.message
 
             incoming_hash = self._hash_manifest(manifest)
+
+            if registry_decision.matched and incoming_hash == self._last_manifest_hash:
+                return {
+                    "status": "SUCCESS",
+                    "message": (
+                        f"{registry_decision.message} "
+                        "Manifesto determinístico equivalente ao último apply já executado. "
+                        "Cleanup e novo apply foram ignorados para evitar remover workload saudável "
+                        "ou recriar recursos em loop."
+                    ),
+                }
+
+            if registry_decision.matched and registry_decision.cleanup_actions:
+                cleanup_messages = []
+
+                for cleanup_action in registry_decision.cleanup_actions:
+                    cleanup_result = DeleteResourceCommand(self.k8s_adapter).execute(
+                        cleanup_action.resource_type,
+                        cleanup_action.name,
+                        cleanup_action.namespace,
+                    )
+                    cleanup_messages.append(str(cleanup_result))
+
+                if cleanup_messages:
+                    guardrail_note = (
+                        f"{guardrail_note} "
+                        f"Limpezas recomendadas executadas: {'; '.join(cleanup_messages)}"
+                    )
+
 
             if incoming_hash == self._last_manifest_hash:
                 return {
@@ -2571,10 +1930,43 @@ spec:
                     ),
                 }
 
+            authoritative_target_namespace = (
+                self.target_namespace
+                if getattr(self, "target_namespace", None)
+                else target_namespace
+            )
+            requested_namespace = args.get("namespace", authoritative_target_namespace)
+
+            safety_decision = self.action_safety_policy.evaluate_delete(
+                ActionSafetyContext(
+                    tool_name="delete_resource",
+                    resource_type=args["resource_type"],
+                    name=args["name"],
+                    namespace=requested_namespace,
+                    target_namespace=authoritative_target_namespace,
+                    last_apply_success=self._last_apply_success,
+                    last_health_after_apply=self._last_health_after_apply,
+                    last_tool_name=self._last_tool_name,
+                    executed_tool_names=list(self._executed_tool_names),
+                )
+            )
+
+            if not safety_decision.allowed:
+                return {
+                    "status": "ERROR",
+                    "message": safety_decision.reason,
+                    "blocked_by": "ActionSafetyPolicy",
+                    "severity": safety_decision.severity,
+                }
+
+            resource_type = self._canonicalize_resource_type(
+                args["resource_type"]
+            )
+
             return DeleteResourceCommand(self.k8s_adapter).execute(
-                args["resource_type"],
+                resource_type,
                 args["name"],
-                target_namespace,
+                requested_namespace,
             )
 
         if tool_name == "scale_resource":

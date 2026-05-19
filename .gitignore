@@ -45,3 +45,14 @@ logs/
 
 # Arquivos públicos/gerados localmente
 public/
+# Local benchmark/result archives
+local_archives/
+final_results_archive/
+*.tar.gz
+
+# Temporary comparison snapshots
+*_current.py
+*_before_*.py
+report_*_latest.md
+scenario_*_current.yaml
+current_use_cases_snapshot/

@@ -64,7 +64,8 @@ class K8sHealthChecker:
                 return False, f"Falha ao consultar pods no namespace {ns}: {pods_result['error']}"
 
             pods_data = pods_result["data"]
-            pods = pods_data.get("items", [])
+            raw_pods = pods_data.get("items", []) or []
+            pods = self._filter_active_pods(raw_pods)
 
             if not pods:
                 stable_success_count = 0
@@ -220,10 +221,32 @@ class K8sHealthChecker:
 
         return False, "Timeout: Os recursos não atingiram estabilidade no tempo previsto"
 
+    def _is_pod_marked_for_deletion(self, pod: Dict[str, Any]) -> bool:
+        metadata = pod.get("metadata", {}) or {}
+        return bool(metadata.get("deletionTimestamp"))
+
+    def _filter_active_pods(self, pods: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        """
+        Remove pods em processo de exclusão antes da análise de saúde.
+
+        Isso evita falso negativo durante rollout: um pod antigo com ErrImagePull,
+        FailedMount ou outro evento crítico pode aparecer por alguns segundos como
+        Terminating após o novo Deployment já ter sido criado. Esse pod não deve
+        contaminar active_pod_names, not_ready_pod_names nem a decisão de eventos.
+        """
+        return [
+            pod
+            for pod in pods or []
+            if not self._is_pod_marked_for_deletion(pod)
+        ]
+
     def _get_active_pod_names(self, pods: List[Dict[str, Any]]) -> Set[str]:
         names: Set[str] = set()
 
         for pod in pods:
+            if self._is_pod_marked_for_deletion(pod):
+                continue
+
             pod_name = pod.get("metadata", {}).get("name")
 
             if pod_name:
@@ -822,6 +845,33 @@ class K8sHealthChecker:
                 return match.group(1)
 
         return ""
+
+    def _is_event_from_relevant_pod(
+        self,
+        involved_kind,
+        involved_name,
+        active_pod_names,
+        not_ready_pod_names,
+    ) -> bool:
+        """
+        Evita falso negativo por evento antigo de pod que já foi substituído.
+
+        Regra:
+        - evento de Pod só deve ser crítico se o pod ainda estiver ativo
+          ou se ainda estiver listado como não pronto;
+        - eventos de pods antigos, removidos ou de ReplicaSets já escalados
+          para zero não devem reprovar o HealthCheck atual.
+        """
+        if str(involved_kind or "").lower() != "pod":
+            return True
+
+        pod_name = str(involved_name or "")
+
+        if not pod_name:
+            return False
+
+        return pod_name in set(active_pod_names or set()) or pod_name in set(not_ready_pod_names or set())
+
 
     def _detect_critical_events(
         self,

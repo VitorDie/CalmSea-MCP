@@ -82,7 +82,7 @@ for msg in st.session_state.messages:
         st.markdown(msg["content"])
 
 # 4. Fluxo de Execução e Monitoramento
-if prompt := st.chat_input("Comando de SRE..."):
+if prompt := st.chat_input("Digite sua pergunta..."):
     st.session_state.messages.append({"role": "user", "content": prompt})
     with st.chat_message("user"):
         st.markdown(prompt)

@@ -42,6 +42,13 @@ def get_ollama_models():
 
 # 3. Configuração na Sidebar
 with st.sidebar:
+    logo_path = "docs/agentkpp_noborder.png"
+    if os.path.exists(logo_path):
+        st.image(logo_path, use_container_width=True)
+    else:
+        # Fallback caso o path mude dentro do container
+        st.info("🤖 AgentK++")
+
     st.title("⚙️ Configuração")
     provider_choice = st.selectbox("Provedor", ["OpenAI", "Ollama (Local)"])
     

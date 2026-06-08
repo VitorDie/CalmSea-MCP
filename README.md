@@ -123,6 +123,15 @@ Neste caso, em remote-kubeconfig.yaml mantenha o arquivo com server: https://loc
 
 Com a infraestrutura de rede e credenciais prontas, você pode levantar os serviços utilizando o Docker Compose como orquestrador.
 
+### Interface Principal do CalmSea (Modo Autonomo):
+
+Inicia o assistente e o servidor MCP integrados.
+
+```bash
+docker compose build --no-cache calmsea
+docker compose up calmsea
+```
+
 ### Interface Principal do Agente (Modo Interativo):
 
 Inicia o assistente e o servidor MCP integrados.
@@ -210,6 +219,11 @@ docker compose up performancetest
 - ✅ Erros Semânticos: **96%** (48/50)
 
 **Taxa de Implementação:** **88%** (44/50 testes bem-sucedidos)
+
+**CalmSea - Exemplo de uso** 
+<p align="center">
+  <img src="docs/images/calmsea-frontend.png" alt="AgentK" width="600" />
+</p>
 
 **AgentK - Exemplo de uso** 
 <p align="center">

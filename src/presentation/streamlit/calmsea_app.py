@@ -141,7 +141,7 @@ checker = K8sHealthChecker()
 adapter = LLMMonitorDecorator(base_adapter, provider_choice, st.session_state.calmsea_collector)
 
 # --- TEMPLATE PRINCIPAL / DASHBOARD ---
-st.title("CalmSea++ Autonomous SRE Engine")
+st.title("CalmSea Autonomous SRE Engine")
 st.markdown("---")
 
 @st.fragment

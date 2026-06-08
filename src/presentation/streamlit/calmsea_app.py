@@ -135,11 +135,10 @@ with st.sidebar:
     st.markdown(f"Status: <span style='color:{status_cor}; font-weight:bold;'>{'EXECUTANDO' if st.session_state.loop_active else 'PARADO'}</span>", unsafe_allow_html=True)
     st.caption(f"Última Varredura: {st.session_state.last_scan}")
 
-# 3. Preparação das ferramentas do Domínio
+# 3. Preparação das ferramentas base da Infraestrutura
 k8s = K8sServiceAdapter()
 checker = K8sHealthChecker()
 adapter = LLMMonitorDecorator(base_adapter, provider_choice, st.session_state.calmsea_collector)
-agent = AgentService(adapter, k8s, health_checker=checker)
 
 # --- TEMPLATE PRINCIPAL / DASHBOARD ---
 st.title("CalmSea++ Autonomous SRE Engine")
@@ -147,14 +146,15 @@ st.markdown("---")
 
 @st.fragment
 def render_monitoring_panel():
-    st.write(f"⏱️ *Última renderização do painel às: {datetime.now().strftime('%H:%M:%S')}*")
+    st.write(f"⏱️ *Última verificação interna às: {datetime.now().strftime('%H:%M:%S')}*")
     
-    # Executa a varredura real nos adaptadores de infraestrutura
+    # 1. Coleta e processamento em tempo real do ecossistema do TCC
     score_default, pods_default, trigger_def, msg_def = scan_namespace_health(k8s, "default")
     score_orion, pods_orion, trigger_orion, msg_orion = scan_namespace_health(k8s, "orion")
     
     score_cluster = int((score_default + score_orion) / 2)
 
+    # 2. Renderização dos Organismos Visuais (Gauges Plotly)
     col1, col2, col3 = st.columns(3)
     with col1:
         st.plotly_chart(create_phantom_gauge("Cluster Global Status", score_cluster), selection_mode="none")
@@ -163,6 +163,7 @@ def render_monitoring_panel():
     with col3:
         st.plotly_chart(create_phantom_gauge("Namespace: orion", score_orion), selection_mode="none")
 
+    # 3. Organismo Tabela Consolidada de Pods
     all_pods = pods_default + pods_orion
     st.markdown("### 📋 Mapeamento de Workloads Ativos")
     
@@ -172,46 +173,50 @@ def render_monitoring_panel():
     else:
         st.info("Nenhum workload ativo mapeado nos namespaces monitorados.")
 
-    # --- CIRCUITO AUTÔNOMO DE INTERVENÇÃO (SRE AUTO-REMEDIAÇÃO CORRIGIDO) ---
+    # --- SOBERANIA OPERACIONAL: CIRCUITO DE AUTO-REMEDIAÇÃO BLINDADO ---
     if st.session_state.loop_active:
-        # Verifica se o timestamp atual ultrapassou o alvo configurado para disparar o agente
         if time.time() >= st.session_state.next_scan_timestamp:
+            
             if trigger_def:
                 st.toast(f"🚨 Anomalia em 'default'! Despertando AgentK...", icon="⚠️")
+                # Instancia o AgentService amarrado estritamente ao namespace correto
+                agent_default = AgentService(adapter, k8s, health_checker=checker, target_namespace="default")
                 with st.spinner("AgentK aplicando engenharia de correção em 'default'..."):
-                    agent.run(user_prompt=(
-                        f"O monitor passivo CalmSea detectou falhas no namespace 'default'. Causa: {msg_def}. "
-                        "INSTRUÇÃO OBRIGATÓRIA: Remova o pod standalone problemático usando delete_resource. "
-                        "Na sequência, use OBLIGATORIAMENTE a ferramenta apply_manifest para recriar o pod "
-                        "com uma imagem válida (ex: nginx:latest). Não encerre a execução com um reply em texto "
-                        "antes de efetivamente aplicar o novo manifesto via tool call."
+                    agent_default.run(user_prompt=(
+                        f"O monitor passivo CalmSea detectou falhas estruturais no namespace 'default'. Causa raiz provável: {msg_def}. "
+                        "DIRETRIZ DE SEGURANÇA INVIOLÁVEL:\n"
+                        "1. Você deve operar ESTREITAMENTE dentro do namespace 'default'.\n"
+                        "2. Execute delete_resource para remover o pod standalone problemático informando explicitamente namespace='default'.\n"
+                        "3. Use a ferramenta apply_manifest para recriar o pod com uma imagem válida (ex: nginx:latest) informando explicitamente namespace='default' no argumento da tool e no metadata do YAML.\n"
+                        "Não encerre com reply e não omita o namespace em nenhuma hipótese."
                     ))
-                st.toast("✅ Processo de remediação finalizado em 'default'!", icon="⚓")
+                st.toast("✅ Ambiente estabilizado em 'default'!", icon="⚓")
                 st.session_state.next_scan_timestamp = time.time() + (intervalo * 60)
                 st.rerun()
 
             if trigger_orion:
                 st.toast(f"🚨 Anomalia em 'orion'! Despertando AgentK...", icon="⚠️")
+                # Instancia o AgentService amarrado estritamente ao namespace correto
+                agent_orion = AgentService(adapter, k8s, health_checker=checker, target_namespace="orion")
                 with st.spinner("AgentK aplicando engenharia de correção em 'orion'..."):
-                    agent.run(user_prompt=(
-                        f"O monitor passivo CalmSea detectou falhas no namespace 'orion'. Causa: {msg_orion}. "
-                        "INSTRUÇÃO OBRIGATÓRIA: Remova o pod standalone problemático usando delete_resource. "
-                        "Na sequência, use OBLIGATORIAMENTE a ferramenta apply_manifest para recriar o pod "
-                        "com uma imagem válida (ex: nginx:latest). Não encerre a execução com um reply em texto "
-                        "antes de efetivamente aplicar o novo manifesto via tool call."
+                    agent_orion.run(user_prompt=(
+                        f"O monitor passivo CalmSea detectou falhas estruturais no namespace 'orion'. Causa raiz provável: {msg_orion}. "
+                        "DIRETRIZ DE SEGURANÇA INVIOLÁVEL:\n"
+                        "1. Você deve operar ESTREITAMENTE dentro do namespace 'orion'.\n"
+                        "2. Execute delete_resource para remover o pod standalone problemático informando explicitamente namespace='orion'.\n"
+                        "3. Use a ferramenta apply_manifest para recriar o pod com uma imagem válida (ex: nginx:latest) informando explicitamente namespace='orion' no argumento da tool e no metadata do YAML.\n"
+                        "Não encerre com reply e não omita o namespace em nenhuma hipótese."
                     ))
-                st.toast("✅ Processo de remediação finalizado em 'orion'!", icon="⚓")
+                st.toast("✅ Ambiente estabilizado em 'orion'!", icon="⚓")
                 st.session_state.next_scan_timestamp = time.time() + (intervalo * 60)
                 st.rerun()
 
-            # Se rodou a checagem e estava tudo limpo (100% saudável)
             st.session_state.next_scan_timestamp = time.time() + (intervalo * 60)
 
 render_monitoring_panel()
 
 # --- 4. ORQUESTRADOR DE ALTA FREQUÊNCIA (HEARTBEAT LOOP) ---
 if st.session_state.loop_active:
-    # Em vez de travar por minutos, dorme apenas 1 segundo mantendo a UI responsiva
     time.sleep(1)
     st.session_state.last_scan = datetime.now().strftime("%H:%M:%S")
     st.rerun()

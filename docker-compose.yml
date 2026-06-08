@@ -67,6 +67,31 @@ services:
       - ./results:/app/results
       - ./docs:/app/docs
 
+  # --- O MONITOR AUTÔNOMO E DASHBOARD (CALMSEA) ---
+  calmsea:
+    build: .
+    container_name: calmsea-monitor
+    network_mode: "host"
+    depends_on:
+      - servermcp
+    environment:
+      - OPENAI_API_KEY=${OPENAI_API_KEY}
+      - PYTHONPATH=/app
+      - KUBECONFIG=/root/.kube/config
+      - OLLAMA_HOST=127.0.0.1:11434
+      # Variáveis de tuning do HealthChecker que o CalmSea vai herdar do seu core
+      - AGENTK_HEALTH_STABLE_SUCCESS_POLLS=2
+      - AGENTK_HEALTH_POLL_INTERVAL_SECONDS=5
+    volumes:
+      - ./src:/app/src
+      - ./remote-kubeconfig.yaml:/root/.kube/config
+      - ./certs-remotos:/app/certs
+      - ./logs:/app/logs
+      - ./results:/app/results
+      - ./docs:/app/docs
+    command: ["streamlit", "run", "src/presentation/streamlit/calmsea_app.py", "--server.port=8502", "--server.address=0.0.0.0"]
+    restart: "unless-stopped"
+
   # --- OPÇÕES DE HARDWARE OLLAMA ---
   ollama-nvidia:
     image: ollama/ollama:latest

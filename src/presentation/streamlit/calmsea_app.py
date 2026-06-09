@@ -2,6 +2,8 @@ import streamlit as st
 import os
 import sys
 import time
+import ollama
+from openai import OpenAI
 from datetime import datetime
 import plotly.graph_objects as go
 import pandas as pd
@@ -31,6 +33,24 @@ if "last_scan" not in st.session_state:
 
 if "next_scan_timestamp" not in st.session_state:
     st.session_state.next_scan_timestamp = 0.0
+
+# --- HELPER: DESCOBERTA DINÂMICA DE MODELOS (IGUAL AO AGENTK) ---
+def get_openai_models(api_key):
+    try:
+        client = OpenAI(api_key=api_key)
+        models = client.models.list()
+        return sorted([m.id for m in models.data if any(x in m.id for x in ["gpt", "o1", "o4"])], reverse=True)
+    except:
+        return ["o4-mini", "o1-mini", "gpt-4o-mini"]
+
+def get_ollama_models():
+    try:
+        response = ollama.list()
+        if hasattr(response, 'models'):
+            return [m.model for m in response.models]
+        return [m['name'] for m in response.get('models', [])]
+    except Exception:
+        return ["qwen2.5:3b"]
 
 # --- ORGANISMO: FÁBRICA DE GAUGE PLOTLY ---
 def create_phantom_gauge(title, score):
@@ -112,20 +132,18 @@ with st.sidebar:
     
     if provider_choice == "OpenAI":
         key = st.text_input("API Key", type="password", value=os.getenv("OPENAI_API_KEY", ""))
-        model_name = st.selectbox("Modelo", ["gpt-4o-mini", "o4-mini", "o1-mini"])
+        model_name = st.selectbox("Modelo", get_openai_models(key))
         base_adapter = OpenAIAdapter(api_key=key, model=model_name)
     else:
-        model_name = st.selectbox("Modelo Local", ["qwen2.5-coder:7b", "llama3.1"])
+        model_name = st.selectbox("Modelo Local", get_ollama_models())
         base_adapter = OllamaAdapter(model=model_name)
 
     intervalo = st.number_input("Intervalo entre análises (minutos)", min_value=1, max_value=60, value=2)
     
-    # Botões de Controle do Estado do Loop (Corrigidos)
     col_btn1, col_btn2 = st.columns(2)
     with col_btn1:
         if st.button("▶️ Iniciar", use_container_width=True):
             st.session_state.loop_active = True
-            # Força a execução imediata na primeira iteração ao zerar o timestamp alvo
             st.session_state.next_scan_timestamp = 0.0
     with col_btn2:
         if st.button("⏹️ Parar", use_container_width=True):
@@ -179,16 +197,15 @@ def render_monitoring_panel():
             
             if trigger_def:
                 st.toast(f"🚨 Anomalia em 'default'! Despertando AgentK...", icon="⚠️")
-                # Instancia o AgentService amarrado estritamente ao namespace correto
                 agent_default = AgentService(adapter, k8s, health_checker=checker, target_namespace="default")
                 with st.spinner("AgentK aplicando engenharia de correção em 'default'..."):
                     agent_default.run(user_prompt=(
                         f"O monitor passivo CalmSea detectou falhas estruturais no namespace 'default'. Causa raiz provável: {msg_def}. "
-                        "DIRETRIZ DE SEGURANÇA INVIOLÁVEL:\n"
+                        "DIRETRIZ DE SEGURANÇA E POLÍTICA DE NOMENCLATURA INVIOLÁVEL:\n"
                         "1. Você deve operar ESTREITAMENTE dentro do namespace 'default'.\n"
                         "2. Execute delete_resource para remover o pod standalone problemático informando explicitamente namespace='default'.\n"
-                        "3. Use a ferramenta apply_manifest para recriar o pod com uma imagem válida (ex: nginx:latest) informando explicitamente namespace='default' no argumento da tool e no metadata do YAML.\n"
-                        "Não encerre com reply e não omita o namespace em nenhuma hipótese."
+                        "3. Use a ferramenta apply_manifest para recriar o recurso mantendo EXATAMENTE o tipo 'kind: Pod' e o nome original 'name: pod-quebrado-tcc'.\n"
+                        "4. É PROIBIDO migrar para Deployment ou alterar o nome do recurso. Substitua apenas a imagem por uma versão válida e estável (ex: nginx:latest) dentro da especificação do Pod original. Não encerre sem a tool call."
                     ))
                 st.toast("✅ Ambiente estabilizado em 'default'!", icon="⚓")
                 st.session_state.next_scan_timestamp = time.time() + (intervalo * 60)
@@ -196,16 +213,15 @@ def render_monitoring_panel():
 
             if trigger_orion:
                 st.toast(f"🚨 Anomalia em 'orion'! Despertando AgentK...", icon="⚠️")
-                # Instancia o AgentService amarrado estritamente ao namespace correto
                 agent_orion = AgentService(adapter, k8s, health_checker=checker, target_namespace="orion")
                 with st.spinner("AgentK aplicando engenharia de correção em 'orion'..."):
                     agent_orion.run(user_prompt=(
                         f"O monitor passivo CalmSea detectou falhas estruturais no namespace 'orion'. Causa raiz provável: {msg_orion}. "
-                        "DIRETRIZ DE SEGURANÇA INVIOLÁVEL:\n"
+                        "DIRETRIZ DE SEGURANÇA E POLÍTICA DE NOMENCLATURA INVIOLÁVEL:\n"
                         "1. Você deve operar ESTREITAMENTE dentro do namespace 'orion'.\n"
                         "2. Execute delete_resource para remover o pod standalone problemático informando explicitamente namespace='orion'.\n"
-                        "3. Use a ferramenta apply_manifest para recriar o pod com uma imagem válida (ex: nginx:latest) informando explicitamente namespace='orion' no argumento da tool e no metadata do YAML.\n"
-                        "Não encerre com reply e não omita o namespace em nenhuma hipótese."
+                        "3. Use a ferramenta apply_manifest para recriar o recurso mantendo EXATAMENTE o tipo 'kind: Pod' e o nome original 'name: pod-quebrado-tcc'.\n"
+                        "4. É PROIBIDO migrar para Deployment ou alterar o nome do recurso. Substitua apenas a imagem por uma versão válida e estável (ex: nginx:latest) dentro da especificação do Pod original. Não encerre sem a tool call."
                     ))
                 st.toast("✅ Ambiente estabilizado em 'orion'!", icon="⚓")
                 st.session_state.next_scan_timestamp = time.time() + (intervalo * 60)

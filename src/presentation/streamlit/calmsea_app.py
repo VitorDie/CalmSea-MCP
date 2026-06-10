@@ -3,6 +3,7 @@ import os
 import sys
 import time
 import ollama
+import json
 from openai import OpenAI
 from datetime import datetime
 import plotly.graph_objects as go
@@ -65,7 +66,6 @@ def create_phantom_gauge(title, score):
     fig = go.Figure(go.Indicator(
         mode="gauge+number",
         value=score,
-        # title={'text': title, 'font': {'size': 16}},
         gauge={
             'axis': {'range': [0, 100], 'tickwidth': 1, 'tickcolor': "darkblue"},
             'bar': {'color': "#1f77b4"},
@@ -146,7 +146,6 @@ with st.sidebar:
     if provider_choice == "OpenAI":
         key = st.text_input("API Key", type="password", value=os.getenv("OPENAI_API_KEY", ""))
         
-        # CORREÇÃO VISUAL: Só busca da API se o estado de cache estiver em branco
         if not st.session_state.cached_openai_models and key:
             st.session_state.cached_openai_models = get_openai_models(key)
             
@@ -154,7 +153,6 @@ with st.sidebar:
         model_name = st.selectbox("Modelo", model_options)
         base_adapter = OpenAIAdapter(api_key=key, model=model_name)
     else:
-        # CORREÇÃO VISUAL: Cache da listagem do Ollama para travar o flicker da tela
         if not st.session_state.cached_ollama_models:
             st.session_state.cached_ollama_models = get_ollama_models()
             
@@ -182,18 +180,18 @@ checker = K8sHealthChecker()
 adapter = LLMMonitorDecorator(base_adapter, provider_choice, st.session_state.calmsea_collector)
 
 # --- TEMPLATE PRINCIPAL / DASHBOARD ---
-st.title("CalmSea Autonomous SRE Engine")
+st.title("CalmSea Dashboard")
 st.markdown("---")
 
 @st.fragment
 def render_monitoring_panel():
     st.write(f"⏱ *Última verificação interna às: {datetime.now().strftime('%H:%M:%S')}*")
     
-    # CORREÇÃO DINÂMICA: Descoberta em tempo real de todos os namespaces ativos no Minikube
+    # Descoberta em tempo real de todos os namespaces ativos no Minikube
     namespaces_reais = k8s.list_namespaces()
     
     if not namespaces_reais:
-        namespaces_reais = ["default"] # Fallback de segurança
+        namespaces_reais = ["default"]
         
     scores_dict = {}
     all_pods_accumulated = []
@@ -204,22 +202,21 @@ def render_monitoring_panel():
         scores_dict[ns] = {
             "score": score_ns,
             "trigger": trigger_ns,
-            "message": msg_ns
+            "message": msg_ns,
+            "pods_lista": pods_ns  # Adicionado para mapeamento interno no circuito dinâmico
         }
         all_pods_accumulated.extend(pods_ns)
         
-    # Média global ponderada pela quantidade de namespaces descobertos
     score_cluster = int(sum(item["score"] for item in scores_dict.values()) / len(scores_dict))
 
-    # CORREÇÃO DINÂMICA: Montagem do Grid de Velocímetros (Gauge Central + N Colunas Dinâmicas)
-    # 2. Renderização do Gauge Principal
+    # Renderização do Gauge Principal
     with st.container(border=True):
         st.markdown("### 📊 Cluster Global Status")
         st.plotly_chart(
             create_phantom_gauge("", score_cluster), 
             selection_mode="none", 
             use_container_width=True,
-            key="gauge_global_cluster"  # Chave estática única para o topo
+            key="gauge_global_cluster"
         )
     
     st.markdown("#### ☸️ Distribuição por Namespaces Ativos")
@@ -240,10 +237,10 @@ def render_monitoring_panel():
                         create_phantom_gauge("", scores_dict[ns]["score"]), 
                         selection_mode="none",
                         use_container_width=True,
-                        key=f"gauge_ns_{ns}"  # CORREÇÃO: Chave dinâmica baseada no nome do namespace
+                        key=f"gauge_ns_{ns}"
                     )
 
-    # 3. Tabela Consolidada Unificada de Pods
+    # Tabela Consolidada Unificada de Pods
     st.markdown("### 📋 Mapeamento de Workloads Ativos")
     if all_pods_accumulated:
         df_pods = pd.DataFrame(all_pods_accumulated)
@@ -251,27 +248,57 @@ def render_monitoring_panel():
     else:
         st.info("Nenhum workload ativo mapeado nos namespaces monitorados.")
 
-    # --- SOBERANIA OPERACIONAL: CIRCUITO DE AUTO-REMEDIAÇÃO AMARRADO ---
+    # --- SOBERANIA OPERACIONAL: CIRCUITO DE AUTO-REMEDIAÇÃO TOTALMENTE AGNÓSTICO ---
     if st.session_state.loop_active:
         if time.time() >= st.session_state.next_scan_timestamp:
             
-            # Varre os gatilhos dinamicamente. Se algum namespace cair, o AgentK acorda focado nele
             for ns in namespaces_reais:
                 if scores_dict[ns]["trigger"]:
                     msg_erro = scores_dict[ns]["message"]
-                    st.toast(f"🚨 Anomalia em '{ns}'! Despertando AgentK...", icon="⚠️")
                     
-                    # Cria o serviço injetando o namespace dinâmico no construtor
+                    # Identifica qual Pod específico disparou o erro neste namespace
+                    pods_do_namespace = scores_dict[ns]["pods_lista"]
+                    pod_afetado = next((p["Pod"] for p in pods_do_namespace if "❌" in p["Health"]), None)
+                    
+                    if not pod_afetado:
+                        continue
+                        
+                    st.toast(f"🚨 Anomalia em '{ns}' no Pod '{pod_afetado}'! Acionando SRE...", icon="⚠️")
+                    
+                    # BACKUP GENÉTICO: Captura a spec estruturada real direto do K8s antes da deleção
+                    spec_original = {}
+                    try:
+                        raw_pod = k8s.read_resource(resource_type="pod", name=pod_afetado, namespace=ns)
+                        if raw_pod and "error" not in raw_pod:
+                            spec_original = {
+                                "metadata": {
+                                    "name": raw_pod.get("metadata", {}).get("name"),
+                                    "labels": raw_pod.get("metadata", {}).get("labels", {})
+                                },
+                                "spec": raw_pod.get("spec", {})
+                            }
+                    except Exception:
+                        pass
+
+                    spec_str = json.dumps(spec_original, indent=2) if spec_original else "Não foi possível extrair a Spec original."
+
+                    # Inicialização do serviço injetando o escopo dinâmico
                     agent_dinamico = AgentService(adapter, k8s, health_checker=checker, target_namespace=ns)
                     
-                    with st.spinner(f"AgentK aplicando engenharia de correção em '{ns}'..."):
+                    with st.spinner(f"AgentK aplicando engenharia de correção em '{ns}' para o pod '{pod_afetado}'..."):
                         agent_dinamico.run(user_prompt=(
-                            f"O monitor passivo CalmSea detectou falhas estruturais no namespace '{ns}'. Causa raiz provável: {msg_erro}. "
-                            f"DIRETRIZ DE SEGURANÇA E POLÍTICA DE NOMENCLATURA INVIOLÁVEL:\n"
-                            f"1. Você deve operar ESTREITAMENTE dentro do namespace '{ns}'.\n"
-                            f"2. Execute delete_resource para remover o pod standalone problemático informando explicitamente namespace='{ns}'.\n"
-                            f"3. Use a ferramenta apply_manifest para recriar o recurso mantendo EXATAMENTE o tipo 'kind: Pod' e o nome original 'name: pod-quebrado-tcc'.\n"
-                            f"4. É PROIBIDO migrar para Deployment ou alterar o nome do recurso. Substitua apenas a imagem por uma versão válida e estável (ex: nginx:latest) dentro da especificação do Pod original. Não encerre sem a tool call."
+                            f"O monitor passivo CalmSea detectou falhas estruturais de infraestrutura.\n"
+                            f"CONTEXTO DO AMBIENTE:\n"
+                            f"- Namespace: '{ns}'\n"
+                            f"- Nome do Pod Alvo: '{pod_afetado}'\n"
+                            f"- Causa Raiz/Erro: {msg_erro}\n"
+                            f"- Especificação Original (JSON): \n{spec_str}\n\n"
+                            f"EXECUTE RIGOROSAMENTE O CHECKLIST DE REMEDIAÇÃO SRE:\n"
+                            f"1. [RESOLUÇÃO] Chame a ferramenta `delete_resource` para remover o Pod problemático '{pod_afetado}' informando explicitamente namespace='{ns}'.\n"
+                            f"2. [MIGRAÇÃO DE IMAGEM] Analise o erro reportado na causa raiz e na Spec original. Identifique qual imagem causou a falha (ex: tags erradas ou typos) e decida por uma versão estável e oficial correspondente (ex: se o erro for no nginx, mude para 'nginx:latest').\n"
+                            f"3. [REMEDIAÇÃO] Imediatamente após o retorno de sucesso do delete, use a ferramenta `apply_manifest` para recriar o recurso.\n"
+                            f"4. [INTEGRIDADE DO MANIFESTO] O novo manifesto YAML deve ser baseado na Especificação Original fornecida, mantendo obrigatoriamente o tipo 'kind: Pod', o mesmo nome original 'name: {pod_afetado}', as mesmas labels e portas, alterando EXCLUSIVAMENTE o campo 'image' do contêiner com a versão corrigida.\n"
+                            f"5. [RESTRIÇÃO] É terminantemente proibido alterar a topologia para 'Deployment' ou encerrar o fluxo respondendo por texto plano sem executar a tool call do `apply_manifest`. Siga até o fim da esteira."
                         ))
                     st.toast(f"✅ Ambiente estabilizado em '{ns}'!", icon="⚓")
                     st.session_state.next_scan_timestamp = time.time() + (intervalo * 60)

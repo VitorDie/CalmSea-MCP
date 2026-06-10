@@ -108,66 +108,32 @@ def scan_namespace_health(k8s_adapter, ns):
             issues = diag.get("detected_issues", [])
             container_states = diag.get("container_states", [])
             
-            # --- CRITÉRIO CIRÚRGICO DE SAÚDE (ESTADO ATUAL) ---
-            # Restart antigo não significa falha atual.
-            # Após reiniciar o Minikube, pods podem ficar Running/Ready com restart_count > 0.
+    # --- CRITÉRIO CIRÚRGICO DE SAÚDE (WHITE-LIST) ---
+            # 1. A fase precisa ser obrigatoriamente Running
             phase_ok = (phase == "Running")
-
+            
+            # 2. Todos os containers precisam estar Ready=True, sem estarem travados em Waiting e com ZERO restarts
             containers_ok = True
             falha_detectada = "Instável"
-
-            active_bad_reasons = {
-                "CrashLoopBackOff",
-                "ImagePullBackOff",
-                "ErrImagePull",
-                "CreateContainerConfigError",
-                "RunContainerError",
-                "InvalidImageName",
-                "ContainerCannotRun",
-                "OOMKilled",
-                "Error",
-            }
-
+            
             if container_states:
                 for c in container_states:
-                    ready = bool(c.get("ready", False))
-                    state = str(c.get("state") or "").strip()
-                    reason = str(c.get("reason") or "").strip()
-                    exit_code = c.get("exit_code")
-
-                    # Se o container não está pronto agora, ele não está saudável.
-                    if not ready:
+                    # Se o container não está pronto OU se ele já sofreu algum restart mecânico
+                    if not c.get("ready", False):
                         containers_ok = False
-                        falha_detectada = reason or state or "ContainerNotReady"
+                        falha_detectada = c.get("reason") or "ContainerNotReady"
                         break
-
-                    # Só considera falha se houver problema ativo no estado atual.
-                    # Não considera restart_count antigo como falha.
-                    if state == "waiting" and reason in active_bad_reasons:
+                    elif c.get("restart_count", 0) > 0:
                         containers_ok = False
-                        falha_detectada = reason
+                        falha_detectada = "CrashLoop/ProbeFailure"
                         break
-
-                    if state == "terminated":
-                        if exit_code not in (None, 0, "0"):
-                            containers_ok = False
-                            falha_detectada = reason or f"Terminated(exitCode={exit_code})"
-                            break
             else:
                 containers_ok = False
-                falha_detectada = "SemContainerStatus"
-
-            # Eventos antigos de probe não devem derrubar um pod que está Running e Ready.
-            has_probe_failure = False
-            if not (phase_ok and containers_ok):
-                has_probe_failure = any(
-                    "probe" in str(iss.get("message", "")).lower()
-                    for iss in issues
-                    if isinstance(iss, dict)
-                )
-
-                if has_probe_failure:
-                    falha_detectada = "ProbeFailure"
+            
+            # 3. Não pode haver histórico latente de falha de sonda nos eventos
+            has_probe_failure = any("probe" in str(iss.get("message", "")).lower() for iss in issues)
+            if has_probe_failure:
+                falha_detectada = "ProbeFailure"
 
             # --- VALIDAÇÃO FINAL ---
             if phase_ok and containers_ok and not has_probe_failure:

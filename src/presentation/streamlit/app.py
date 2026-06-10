@@ -38,7 +38,7 @@ def get_ollama_models():
             return [m.model for m in response.models]
         return [m['name'] for m in response.get('models', [])]
     except Exception as e:
-        return [""]
+        return []
 
 # 3. Configuração na Sidebar
 with st.sidebar:
@@ -57,7 +57,24 @@ with st.sidebar:
         model_name = st.selectbox("Modelo", get_openai_models(key))
         base_adapter = OpenAIAdapter(api_key=key, model=model_name)
     else:
-        model_name = st.selectbox("Modelo Local", get_ollama_models())
+        # 1. Busca a lista de modelos atualizada
+        lista_modelos = get_ollama_models()
+        
+        # 2. Valida se a lista veio vazia (erro de conexão com o Ollama)
+        if not lista_modelos:
+            st.error("⚠️ O container do Ollama está desligado!")
+            st.info("💡 Execute no terminal:\n\n`docker compose up -d ollama-cpu`" \
+            "\n\nou\n\n" \
+            "`docker compose --profile nvidia up -d ollama-nvidia`" \
+            "\n\nou\n\n" \
+            "`docker compose --profile amd up -d ollama-amd`")
+            
+            # Valores de fallback para a UI não estourar erro na renderização
+            model_name = "Nenhum"
+        else:
+            # Se achou modelos, renderiza o selectbox normalmente
+            model_name = st.selectbox("Modelo Local", lista_modelos)
+
         base_adapter = OllamaAdapter(model=model_name)
 
     # A MAGICA: Embrulha o adaptador com o Monitor para contar tokens/tempo

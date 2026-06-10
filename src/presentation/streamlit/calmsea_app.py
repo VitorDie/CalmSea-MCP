@@ -57,7 +57,7 @@ def get_ollama_models():
             return [m.model for m in response.models]
         return [m['name'] for m in response.get('models', [])]
     except Exception:
-        return ["qwen2.5:3b"]
+        return []
 
 # --- ORGANISMO: FÁBRICA DE GAUGE PLOTLY ---
 def create_phantom_gauge(title, score):
@@ -212,11 +212,29 @@ with st.sidebar:
         model_name = st.selectbox("Modelo", model_options)
         base_adapter = OpenAIAdapter(api_key=key, model=model_name)
     else:
-        if not st.session_state.cached_ollama_models:
+        # Se o cache estiver vazio ou só tiver o modelo fake de erro, tenta buscar de verdade
+        if not st.session_state.cached_ollama_models or st.session_state.cached_ollama_models == ["Container Desligado"]:
             st.session_state.cached_ollama_models = get_ollama_models()
             
-        model_name = st.selectbox("Modelo Local", st.session_state.cached_ollama_models)
-        base_adapter = OllamaAdapter(model=model_name)
+        # Se a função get_ollama_models retornou uma lista vazia [], significa que deu Exception (desligado)
+        if not st.session_state.cached_ollama_models:
+            st.error("⚠️ O container do Ollama está desligado!")
+            st.info("💡 Execute no terminal:\n\n`docker compose up -d ollama-cpu`" \
+            "\n\nou\n\n" \
+            "`docker compose --profile nvidia up -d ollama-nvidia`" \
+            "\n\nou\n\n" \
+            "`docker compose --profile amd up -d ollama-amd`")
+
+            
+            # Força um valor temporário no cache para não quebrar o selectbox, 
+            # mas que permite tentar de novo no próximo carregamento
+            opcoes_modelo = ["Container Desligado"]
+            model_name = "Nenhum"
+        else:
+            opcoes_modelo = st.session_state.cached_ollama_models
+            model_name = st.selectbox("Modelo Local", opcoes_modelo)
+
+    base_adapter = OllamaAdapter(model=model_name)
 
     intervalo = st.number_input("Intervalo entre análises (minutos)", min_value=1, max_value=60, value=2)
     

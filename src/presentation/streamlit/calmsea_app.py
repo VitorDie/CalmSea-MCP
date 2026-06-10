@@ -65,7 +65,7 @@ def create_phantom_gauge(title, score):
     fig = go.Figure(go.Indicator(
         mode="gauge+number",
         value=score,
-        title={'text': title, 'font': {'size': 16}},
+        # title={'text': title, 'font': {'size': 16}},
         gauge={
             'axis': {'range': [0, 100], 'tickwidth': 1, 'tickcolor': "darkblue"},
             'bar': {'color': "#1f77b4"},
@@ -79,7 +79,7 @@ def create_phantom_gauge(title, score):
             ],
         }
     ))
-    fig.update_layout(height=200, margin=dict(l=10, r=10, t=35, b=10))
+    fig.update_layout(height=150, margin=dict(l=10, r=10, t=10, b=10))
     return fig
 
 # --- ENGINE: CÁLCULO DE SCORE E DIAGNÓSTICO REAL ---
@@ -212,28 +212,35 @@ def render_monitoring_panel():
     score_cluster = int(sum(item["score"] for item in scores_dict.values()) / len(scores_dict))
 
     # CORREÇÃO DINÂMICA: Montagem do Grid de Velocímetros (Gauge Central + N Colunas Dinâmicas)
-# 2. Renderização do Gauge Principal
-    st.plotly_chart(create_phantom_gauge("Cluster Global Status", score_cluster), selection_mode="none")
+    # 2. Renderização do Gauge Principal
+    with st.container(border=True):
+        st.markdown("### 📊 Cluster Global Status")
+        st.plotly_chart(
+            create_phantom_gauge("", score_cluster), 
+            selection_mode="none", 
+            use_container_width=True,
+            key="gauge_global_cluster"  # Chave estática única para o topo
+        )
     
     st.markdown("#### ☸️ Distribuição por Namespaces Ativos")
     
-    # CORREÇÃO VISUAL: Grid responsivo com quebra de linha (Máximo 3 colunas por linha)
+    # Grid responsivo com quebra de linha (Máximo 3 colunas por linha)
     MAX_COLS = 3
     namespaces_lista = list(namespaces_reais)
     
-    # Divide a lista de namespaces em grupos de no máximo MAX_COLS
     for i in range(0, len(namespaces_lista), MAX_COLS):
         grupo_ns = namespaces_lista[i:i + MAX_COLS]
-        cols_namespaces = st.columns(len(grupo_ns)) # Cria colunas apenas para o grupo atual
+        cols_namespaces = st.columns(len(grupo_ns)) 
         
         for idx, ns in enumerate(grupo_ns):
             with cols_namespaces[idx]:
-                # Criamos um container visual estruturado para cada velocímetro
                 with st.container(border=True):
+                    st.markdown(f"📦 **NS: {ns}**")
                     st.plotly_chart(
-                        create_phantom_gauge(f"NS: {ns}", scores_dict[ns]["score"]), 
+                        create_phantom_gauge("", scores_dict[ns]["score"]), 
                         selection_mode="none",
-                        use_container_width=True # FORÇA o Plotly a respeitar a largura da coluna
+                        use_container_width=True,
+                        key=f"gauge_ns_{ns}"  # CORREÇÃO: Chave dinâmica baseada no nome do namespace
                     )
 
     # 3. Tabela Consolidada Unificada de Pods

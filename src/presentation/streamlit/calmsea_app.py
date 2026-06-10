@@ -311,14 +311,17 @@ def render_monitoring_panel():
                     
                     with st.spinner(f"AgentK aplicando engenharia de correção em '{ns}' para o pod '{pod_afetado}'..."):
                         agent_dinamico.run(user_prompt=(
-                            f"AMBIENTE: Namespace '{ns}' | Recurso Alvo: Pod '{pod_afetado}'\n"
-                            f"TELEMETRIA DO ERRO: {msg_erro}\n"
-                            f"JSON ORIGINAL DO TRABALHO:\n{spec_str}\n\n"
-                            f"EXECUTE EXCLUSIVAMENTE ESTES 3 PASSOS NA ORDEM ABAIXO:\n"
-                            f"1. [DELETAR] Se o Pod '{pod_afetado}' ainda existir no cluster, execute a ferramenta `delete_resource` para removê-lo.\n"
-                            f"2. [CORRIGIR E APLICAR] Na iteração seguinte, use a ferramenta `apply_manifest`. Monte o YAML mantendo o tipo 'kind: Pod', o nome 'name: {pod_afetado}' e as portas originais do JSON. Altere OBRIGATORIAMENTE o campo 'image' para usar o valor fixo 'nginx:latest'. É proibido usar a tag de imagem antiga.\n"
-                            f"3. [REGRA DE PARADA MANDATÓRIA] Assim que a ferramenta `apply_manifest` retornar sucesso ('pod created'), dê a missão como cumprida e finalize a execução imediatamente na próxima iteração. É PROIBIDO chamar qualquer outra ferramenta ou tentar aplicar o manifesto novamente."
-                       ))
+                            f"AMBIENTE: Namespace '{ns}' | Pod com problema: '{pod_afetado}'\n"
+                            f"TEXTO DO ERRO: {msg_erro}\n"
+                            f"JSON ORIGINAL DO POD:\n{spec_str}\n\n"
+                            f"ESTRATÉGIA OBRIGATÓRIA:\n"
+                            f"1. Use as ferramentas disponíveis para extrair o estado real do cluster no namespace '{ns}'. Se necessário, liste os recursos primeiro e busque detalhes/logs apenas dos suspeitos.\n"
+                            f"2. Execute obrigatoriamente a ferramenta `get_pod_diagnostics` para qualquer Pod que esteja em estado Pending, ContainerCreating, FailedMount, ImagePullBackOff, ErrImagePull, CrashLoopBackOff, Error ou CreateContainerConfigError para validar a causa-raiz estrutural antes de aplicar alterações.\n\n"
+                            f"SIGA EXATAMENTE ESTES 3 PASSOS EM SEQUÊNCIA (PROIBIDO TEXTO LIVRE OU PEDIR DADOS):\n"
+                            f"Passo 1: [DELETAR] Chame a ferramenta `delete_resource` para apagar o Pod '{pod_afetado}' do namespace '{ns}'. É obrigatório apagar o Pod antes de tentar criar um novo, porque Pods não aceitam atualizações diretas de configuração enquanto estão vivos.\n"
+                            f"Passo 2: [CORRIGIR E APLICAR] Na iteração seguinte, use a ferramenta `apply_manifest`. Monte o YAML do Pod usando o mesmo nome '{pod_afetado}'. Mantenha as portas, variáveis e volumes do JSON original, mas corrija o campo que causou o erro\n"
+                            f"Passo 3: [REGRA DE PARADA] Assim que a ferramenta `apply_manifest` retornar sucesso ('created'), use a ação `reply` apenas para avisar que terminou e finalize o programa imediatamente."
+                ))
                         
                     st.toast(f"📦 Recurso recriado em '{ns}'! Aguardando estabilização do container...", icon="⏳")
                     necessita_rerun = True

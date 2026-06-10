@@ -199,7 +199,9 @@ docker compose up performancetest
 ## 🏗️ Arquitetura
 
 <p align="center">
-  <img src="docs/agent-k-arch.png" alt="AgentK" width="500" />
+  <img src="docs/calmsea_user_arch.png" alt="AgentK" width="500" />
+  <img src="docs/calmsea_modules.png" alt="AgentK" width="500" />
+  <img src="docs/calmsea_domain.png" alt="AgentK" width="500" />
 </p>
 
 ## 📚 Documentação Completa

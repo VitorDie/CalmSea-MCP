@@ -21,7 +21,7 @@ from src.application.services.agent_service import AgentService
 
 st.set_page_config(page_title="CalmSea SRE Monitor", page_icon="🌊", layout="wide")
 
-# 2. Inicialização do Estado da Sessão (Controle de Batimento Cíclico)
+# 2. Inicialização do Estado da Sessão (Controle de Batimento Cíclico e Cache)
 if "calmsea_collector" not in st.session_state:
     st.session_state.calmsea_collector = TCCMetricsCollector(filename="results/calmsea_benchmark.csv")
 
@@ -34,7 +34,14 @@ if "last_scan" not in st.session_state:
 if "next_scan_timestamp" not in st.session_state:
     st.session_state.next_scan_timestamp = 0.0
 
-# --- HELPER: DESCOBERTA DINÂMICA DE MODELOS (IGUAL AO AGENTK) ---
+# CORREÇÃO VISUAL: Inicialização de chaves de cache para evitar "piscadas" na UI
+if "cached_ollama_models" not in st.session_state:
+    st.session_state.cached_ollama_models = []
+
+if "cached_openai_models" not in st.session_state:
+    st.session_state.cached_openai_models = []
+
+# --- HELPER: DESCOBERTA DINÂMICA DE MODELOS ---
 def get_openai_models(api_key):
     try:
         client = OpenAI(api_key=api_key)
@@ -58,7 +65,7 @@ def create_phantom_gauge(title, score):
     fig = go.Figure(go.Indicator(
         mode="gauge+number",
         value=score,
-        title={'text': title, 'font': {'size': 18}},
+        title={'text': title, 'font': {'size': 16}},
         gauge={
             'axis': {'range': [0, 100], 'tickwidth': 1, 'tickcolor': "darkblue"},
             'bar': {'color': "#1f77b4"},
@@ -72,7 +79,7 @@ def create_phantom_gauge(title, score):
             ],
         }
     ))
-    fig.update_layout(height=220, margin=dict(l=20, r=20, t=40, b=20))
+    fig.update_layout(height=200, margin=dict(l=10, r=10, t=35, b=10))
     return fig
 
 # --- ENGINE: CÁLCULO DE SCORE E DIAGNÓSTICO REAL ---
@@ -125,17 +132,33 @@ def scan_namespace_health(k8s_adapter, ns):
 
     return score, pods_table_rows, remediation_trigger, critical_msg
 
-# --- MOLÉCULA: SIDEBAR ---
+# --- MOLÉCULA: SIDEBAR (CONFIGURAÇÕES DINÂMICAS E CACHEADAS) ---
 with st.sidebar:
-    st.title("🌊 CalmSea Config")
+    logo_path = "docs/calmsea_logo.png"
+    if os.path.exists(logo_path):
+        st.image(logo_path, use_container_width=True)
+    else:
+        st.info("🌊 CalmSea")
+    
+    st.title("⚙️ Configuração")
     provider_choice = st.selectbox("Provedor", ["OpenAI", "Ollama (Local)"])
     
     if provider_choice == "OpenAI":
         key = st.text_input("API Key", type="password", value=os.getenv("OPENAI_API_KEY", ""))
-        model_name = st.selectbox("Modelo", get_openai_models(key))
+        
+        # CORREÇÃO VISUAL: Só busca da API se o estado de cache estiver em branco
+        if not st.session_state.cached_openai_models and key:
+            st.session_state.cached_openai_models = get_openai_models(key)
+            
+        model_options = st.session_state.cached_openai_models if st.session_state.cached_openai_models else ["gpt-4o-mini", "o4-mini"]
+        model_name = st.selectbox("Modelo", model_options)
         base_adapter = OpenAIAdapter(api_key=key, model=model_name)
     else:
-        model_name = st.selectbox("Modelo Local", get_ollama_models())
+        # CORREÇÃO VISUAL: Cache da listagem do Ollama para travar o flicker da tela
+        if not st.session_state.cached_ollama_models:
+            st.session_state.cached_ollama_models = get_ollama_models()
+            
+        model_name = st.selectbox("Modelo Local", st.session_state.cached_ollama_models)
         base_adapter = OllamaAdapter(model=model_name)
 
     intervalo = st.number_input("Intervalo entre análises (minutos)", min_value=1, max_value=60, value=2)
@@ -164,68 +187,88 @@ st.markdown("---")
 
 @st.fragment
 def render_monitoring_panel():
-    st.write(f"⏱️ *Última verificação interna às: {datetime.now().strftime('%H:%M:%S')}*")
+    st.write(f"⏱ *Última verificação interna às: {datetime.now().strftime('%H:%M:%S')}*")
     
-    # 1. Coleta e processamento em tempo real do ecossistema do TCC
-    score_default, pods_default, trigger_def, msg_def = scan_namespace_health(k8s, "default")
-    score_orion, pods_orion, trigger_orion, msg_orion = scan_namespace_health(k8s, "orion")
+    # CORREÇÃO DINÂMICA: Descoberta em tempo real de todos os namespaces ativos no Minikube
+    namespaces_reais = k8s.list_namespaces()
     
-    score_cluster = int((score_default + score_orion) / 2)
+    if not namespaces_reais:
+        namespaces_reais = ["default"] # Fallback de segurança
+        
+    scores_dict = {}
+    all_pods_accumulated = []
+    
+    # Varredura paralela/cíclica em lote coletando scores de saúde
+    for ns in namespaces_reais:
+        score_ns, pods_ns, trigger_ns, msg_ns = scan_namespace_health(k8s, ns)
+        scores_dict[ns] = {
+            "score": score_ns,
+            "trigger": trigger_ns,
+            "message": msg_ns
+        }
+        all_pods_accumulated.extend(pods_ns)
+        
+    # Média global ponderada pela quantidade de namespaces descobertos
+    score_cluster = int(sum(item["score"] for item in scores_dict.values()) / len(scores_dict))
 
-    # 2. Renderização dos Organismos Visuais (Gauges Plotly)
-    col1, col2, col3 = st.columns(3)
-    with col1:
-        st.plotly_chart(create_phantom_gauge("Cluster Global Status", score_cluster), selection_mode="none")
-    with col2:
-        st.plotly_chart(create_phantom_gauge("Namespace: default", score_default), selection_mode="none")
-    with col3:
-        st.plotly_chart(create_phantom_gauge("Namespace: orion", score_orion), selection_mode="none")
+    # CORREÇÃO DINÂMICA: Montagem do Grid de Velocímetros (Gauge Central + N Colunas Dinâmicas)
+# 2. Renderização do Gauge Principal
+    st.plotly_chart(create_phantom_gauge("Cluster Global Status", score_cluster), selection_mode="none")
+    
+    st.markdown("#### ☸️ Distribuição por Namespaces Ativos")
+    
+    # CORREÇÃO VISUAL: Grid responsivo com quebra de linha (Máximo 3 colunas por linha)
+    MAX_COLS = 3
+    namespaces_lista = list(namespaces_reais)
+    
+    # Divide a lista de namespaces em grupos de no máximo MAX_COLS
+    for i in range(0, len(namespaces_lista), MAX_COLS):
+        grupo_ns = namespaces_lista[i:i + MAX_COLS]
+        cols_namespaces = st.columns(len(grupo_ns)) # Cria colunas apenas para o grupo atual
+        
+        for idx, ns in enumerate(grupo_ns):
+            with cols_namespaces[idx]:
+                # Criamos um container visual estruturado para cada velocímetro
+                with st.container(border=True):
+                    st.plotly_chart(
+                        create_phantom_gauge(f"NS: {ns}", scores_dict[ns]["score"]), 
+                        selection_mode="none",
+                        use_container_width=True # FORÇA o Plotly a respeitar a largura da coluna
+                    )
 
-    # 3. Organismo Tabela Consolidada de Pods
-    all_pods = pods_default + pods_orion
+    # 3. Tabela Consolidada Unificada de Pods
     st.markdown("### 📋 Mapeamento de Workloads Ativos")
-    
-    if all_pods:
-        df_pods = pd.DataFrame(all_pods)
+    if all_pods_accumulated:
+        df_pods = pd.DataFrame(all_pods_accumulated)
         st.dataframe(df_pods, use_container_width=True, hide_index=True)
     else:
         st.info("Nenhum workload ativo mapeado nos namespaces monitorados.")
 
-    # --- SOBERANIA OPERACIONAL: CIRCUITO DE AUTO-REMEDIAÇÃO BLINDADO ---
+    # --- SOBERANIA OPERACIONAL: CIRCUITO DE AUTO-REMEDIAÇÃO AMARRADO ---
     if st.session_state.loop_active:
         if time.time() >= st.session_state.next_scan_timestamp:
             
-            if trigger_def:
-                st.toast(f"🚨 Anomalia em 'default'! Despertando AgentK...", icon="⚠️")
-                agent_default = AgentService(adapter, k8s, health_checker=checker, target_namespace="default")
-                with st.spinner("AgentK aplicando engenharia de correção em 'default'..."):
-                    agent_default.run(user_prompt=(
-                        f"O monitor passivo CalmSea detectou falhas estruturais no namespace 'default'. Causa raiz provável: {msg_def}. "
-                        "DIRETRIZ DE SEGURANÇA E POLÍTICA DE NOMENCLATURA INVIOLÁVEL:\n"
-                        "1. Você deve operar ESTREITAMENTE dentro do namespace 'default'.\n"
-                        "2. Execute delete_resource para remover o pod standalone problemático informando explicitamente namespace='default'.\n"
-                        "3. Use a ferramenta apply_manifest para recriar o recurso mantendo EXATAMENTE o tipo 'kind: Pod' e o nome original 'name: pod-quebrado-tcc'.\n"
-                        "4. É PROIBIDO migrar para Deployment ou alterar o nome do recurso. Substitua apenas a imagem por uma versão válida e estável (ex: nginx:latest) dentro da especificação do Pod original. Não encerre sem a tool call."
-                    ))
-                st.toast("✅ Ambiente estabilizado em 'default'!", icon="⚓")
-                st.session_state.next_scan_timestamp = time.time() + (intervalo * 60)
-                st.rerun()
-
-            if trigger_orion:
-                st.toast(f"🚨 Anomalia em 'orion'! Despertando AgentK...", icon="⚠️")
-                agent_orion = AgentService(adapter, k8s, health_checker=checker, target_namespace="orion")
-                with st.spinner("AgentK aplicando engenharia de correção em 'orion'..."):
-                    agent_orion.run(user_prompt=(
-                        f"O monitor passivo CalmSea detectou falhas estruturais no namespace 'orion'. Causa raiz provável: {msg_orion}. "
-                        "DIRETRIZ DE SEGURANÇA E POLÍTICA DE NOMENCLATURA INVIOLÁVEL:\n"
-                        "1. Você deve operar ESTREITAMENTE dentro do namespace 'orion'.\n"
-                        "2. Execute delete_resource para remover o pod standalone problemático informando explicitamente namespace='orion'.\n"
-                        "3. Use a ferramenta apply_manifest para recriar o recurso mantendo EXATAMENTE o tipo 'kind: Pod' e o nome original 'name: pod-quebrado-tcc'.\n"
-                        "4. É PROIBIDO migrar para Deployment ou alterar o nome do recurso. Substitua apenas a imagem por uma versão válida e estável (ex: nginx:latest) dentro da especificação do Pod original. Não encerre sem a tool call."
-                    ))
-                st.toast("✅ Ambiente estabilizado em 'orion'!", icon="⚓")
-                st.session_state.next_scan_timestamp = time.time() + (intervalo * 60)
-                st.rerun()
+            # Varre os gatilhos dinamicamente. Se algum namespace cair, o AgentK acorda focado nele
+            for ns in namespaces_reais:
+                if scores_dict[ns]["trigger"]:
+                    msg_erro = scores_dict[ns]["message"]
+                    st.toast(f"🚨 Anomalia em '{ns}'! Despertando AgentK...", icon="⚠️")
+                    
+                    # Cria o serviço injetando o namespace dinâmico no construtor
+                    agent_dinamico = AgentService(adapter, k8s, health_checker=checker, target_namespace=ns)
+                    
+                    with st.spinner(f"AgentK aplicando engenharia de correção em '{ns}'..."):
+                        agent_dinamico.run(user_prompt=(
+                            f"O monitor passivo CalmSea detectou falhas estruturais no namespace '{ns}'. Causa raiz provável: {msg_erro}. "
+                            f"DIRETRIZ DE SEGURANÇA E POLÍTICA DE NOMENCLATURA INVIOLÁVEL:\n"
+                            f"1. Você deve operar ESTREITAMENTE dentro do namespace '{ns}'.\n"
+                            f"2. Execute delete_resource para remover o pod standalone problemático informando explicitamente namespace='{ns}'.\n"
+                            f"3. Use a ferramenta apply_manifest para recriar o recurso mantendo EXATAMENTE o tipo 'kind: Pod' e o nome original 'name: pod-quebrado-tcc'.\n"
+                            f"4. É PROIBIDO migrar para Deployment ou alterar o nome do recurso. Substitua apenas a imagem por uma versão válida e estável (ex: nginx:latest) dentro da especificação do Pod original. Não encerre sem a tool call."
+                        ))
+                    st.toast(f"✅ Ambiente estabilizado em '{ns}'!", icon="⚓")
+                    st.session_state.next_scan_timestamp = time.time() + (intervalo * 60)
+                    st.rerun()
 
             st.session_state.next_scan_timestamp = time.time() + (intervalo * 60)
 

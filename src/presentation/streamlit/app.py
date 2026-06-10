@@ -17,7 +17,7 @@ from src.infrastructure.k8s_adapter.service import K8sServiceAdapter
 from src.application.services.agent_service import AgentService
 from src.application.services.report_exporter import ReportExporter
 
-st.set_page_config(page_title="AgentK Dashboard", page_icon="☸️", layout="wide")
+st.set_page_config(page_title="AgentK Dashboard", page_icon="🤖", layout="wide")
 
 # 2. Inicialização do Coletor de Métricas (Persistente na sessão)
 if "collector" not in st.session_state:

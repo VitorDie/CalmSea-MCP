@@ -211,7 +211,7 @@ def render_monitoring_panel():
             key="gauge_global_cluster"
         )
     
-    st.markdown("#### ☸️ Distribuição por Namespaces Ativos")
+    st.markdown("#### 📊 Distribuição por Namespaces Ativos")
     
     MAX_COLS = 3
     namespaces_lista = list(namespaces_reais)
@@ -285,13 +285,12 @@ def render_monitoring_panel():
                             f"Anomalia crítica detectada no namespace '{ns}' para o recurso Pod '{pod_afetado}'.\n"
                             f"Telemetria do Erro: {msg_erro}\n"
                             f"Especificação Atual no Cluster (JSON): \n{spec_str}\n\n"
-                            f"ESTRATÉGIA OBRIGATÓRIA DE SRE (WATCHDOG PROTOCOL):\n"
-                            f"1. [RESOLUÇÃO] Use a ferramenta `get_pod_diagnostics` se precisar coletar eventos profundos ou logs adicionais.\n"
-                            f"2. [ISOLAMENTO] Execute `delete_resource` para remover o Pod problemático '{pod_afetado}' do namespace '{ns}'.\n"
-                            f"3. [REMEDIAÇÃO] Use a ferramenta `apply_manifest` para recriar o Pod baseado na Especificação Original, corrigindo unicamente a tag de imagem corrompida por uma oficial e estável (ex: se o erro for no nginx, use 'nginx:latest'; se for outra aplicação, mude para a correspondente estável).\n"
-                            f"4. [WATCHDOG] Não reaplique manifestos idênticos em loops iterativos. É proibido repetir a mesma tentativa de correção se ela retornar um erro de validação da API.\n"
-                            f"5. [SINAL DE PARADA] Se o `apply_manifest` for bem-sucedido, o motor de HealthCheck validará o ambiente automaticamente. Assim que o ambiente estiver estável, encerre a execução imediatamente (FINALIZE).\n"
-                            f"6. [RESTRIÇÃO] Mantenha rigorosamente o tipo 'kind: Pod' e o nome original 'name: {pod_afetado}'. Não migre para Deployment e não encerre por texto puro (reply) sem ter executado a correção física no cluster."
+                            f"ESTRATÉGIA RIGOROSA DE AUTO-REMEDIAÇÃO (PROTOCOLO DE SOBERANIA):\n"
+                            f"1. [RESOLUÇÃO] Se o Pod '{pod_afetado}' ainda existir, execute IMEDIATAMENTE a ferramenta `delete_resource` para removê-lo.\n"
+                            f"2. [CONSTRUÇÃO] Após o delete retornar SUCCESS, crie um novo manifesto YAML mantendo rigorosamente 'kind: Pod', o nome 'name: {pod_afetado}' e o namespace '{ns}'.\n"
+                            f"3. [INTEGRIDADE] Mantenha o nome do container interno idêntico ao metadado original fornecido no JSON para evitar erros de imutabilidade. Altere APENAS a tag da imagem para uma versão estável oficial (ex: 'nginx:latest').\n"
+                            f"4. [REMEDIAÇÃO] Execute a ferramenta `apply_manifest` uma única vez para subir o recurso corrigido.\n"
+                            f"5. [SINAL DE PARADA OBRIGATÓRIO] Assim que a ferramenta `apply_manifest` retornar status 'SUCCESS' (recurso criado), você cumpriu sua missão. É EXPRESSAMENTE PROIBIDO tentar aplicar novos manifestos por cima na próxima iteração ou deletar o pod novamente. O motor de automação em Python cuidará do HealthCheck ativo. Encerre imediatamente o fluxo."
                         ))
                         
                     st.toast(f"✅ Ambiente estabilizado em '{ns}'!", icon="⚓")

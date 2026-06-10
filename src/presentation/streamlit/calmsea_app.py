@@ -20,7 +20,7 @@ from src.infrastructure.k8s_adapter.service import K8sServiceAdapter
 from src.infrastructure.k8s_adapter.health_checker import K8sHealthChecker
 from src.application.services.agent_service import AgentService
 
-st.set_page_config(page_title="CalmSea", page_icon="🌊", layout="wide")
+st.set_page_config(page_title="CalmSea SRE Monitor", page_icon="🌊", layout="wide")
 
 # 2. Inicialização do Estado da Sessão (Controle de Batimento Cíclico e Cache)
 if "calmsea_collector" not in st.session_state:
@@ -35,7 +35,6 @@ if "last_scan" not in st.session_state:
 if "next_scan_timestamp" not in st.session_state:
     st.session_state.next_scan_timestamp = 0.0
 
-# CORREÇÃO VISUAL: Inicialização de chaves de cache para evitar "piscadas" na UI
 if "cached_ollama_models" not in st.session_state:
     st.session_state.cached_ollama_models = []
 
@@ -62,7 +61,7 @@ def get_ollama_models():
 
 # --- ORGANISMO: FÁBRICA DE GAUGE PLOTLY ---
 def create_phantom_gauge(title, score):
-    """Gera o velocímetro de integridade baseado no score calculado (Sem título interno para evitar cortes)."""
+    """Gera o velocímetro de integridade baseado no score calculado."""
     fig = go.Figure(go.Indicator(
         mode="gauge+number",
         value=score,
@@ -134,13 +133,7 @@ def scan_namespace_health(k8s_adapter, ns):
 
 # --- MOLÉCULA: SIDEBAR (CONFIGURAÇÕES DINÂMICAS E CACHEADAS) ---
 with st.sidebar:
-    logo_path = "docs/calmsea_logo.png"
-    if os.path.exists(logo_path):
-        st.image(logo_path, use_container_width=True)
-    else:
-        st.info("🌊 CalmSea")
-    
-    st.title("⚙️ Configuração")
+    st.title("🌊 CalmSea Config")
     provider_choice = st.selectbox("Provedor", ["OpenAI", "Ollama (Local)"])
     
     if provider_choice == "OpenAI":
@@ -163,11 +156,13 @@ with st.sidebar:
     
     col_btn1, col_btn2 = st.columns(2)
     with col_btn1:
-        if st.button("▶️ Iniciar", use_container_width=True):
+        # CORREÇÃO: Removido parâmetro depreciado do botão
+        if st.button("▶️ Iniciar"):
             st.session_state.loop_active = True
             st.session_state.next_scan_timestamp = 0.0
     with col_btn2:
-        if st.button("⏹️ Parar", use_container_width=True):
+        # CORREÇÃO: Removido parâmetro depreciado do botão
+        if st.button("⏹️ Parar"):
             st.session_state.loop_active = False
 
     status_cor = "green" if st.session_state.loop_active else "red"
@@ -187,16 +182,13 @@ st.markdown("---")
 def render_monitoring_panel():
     st.write(f"⏱ *Última verificação interna às: {datetime.now().strftime('%H:%M:%S')}*")
     
-    # Descoberta em tempo real de todos os namespaces ativos no Minikube
     namespaces_reais = k8s.list_namespaces()
-    
     if not namespaces_reais:
         namespaces_reais = ["default"]
         
     scores_dict = {}
     all_pods_accumulated = []
     
-    # Varredura paralela/cíclica em lote coletando scores de saúde
     for ns in namespaces_reais:
         score_ns, pods_ns, trigger_ns, msg_ns = scan_namespace_health(k8s, ns)
         scores_dict[ns] = {
@@ -209,19 +201,18 @@ def render_monitoring_panel():
         
     score_cluster = int(sum(item["score"] for item in scores_dict.values()) / len(scores_dict))
 
-    # Renderização do Gauge Principal (Ajustado para usar Container e chave estática)
+    # CORREÇÃO: Substituído use_container_width por width="stretch" no container principal
     with st.container(border=True):
         st.markdown("### 📊 Cluster Global Status")
         st.plotly_chart(
             create_phantom_gauge("", score_cluster), 
             selection_mode="none", 
-            use_container_width=True,
+            width="stretch",
             key="gauge_global_cluster"
         )
     
     st.markdown("#### ☸️ Distribuição por Namespaces Ativos")
     
-    # Grid responsivo com quebra de linha (Máximo 3 colunas por linha para evitar esmagamento)
     MAX_COLS = 3
     namespaces_lista = list(namespaces_reais)
     
@@ -232,20 +223,20 @@ def render_monitoring_panel():
         for idx, ns in enumerate(grupo_ns):
             with cols_namespaces[idx]:
                 with st.container(border=True):
-                    # Título nativo do Streamlit para evitar que o Plotly corte o texto (...)
                     st.markdown(f"📦 **NS: {ns}**")
+                    # CORREÇÃO: Substituído use_container_width por width="stretch"
                     st.plotly_chart(
                         create_phantom_gauge("", scores_dict[ns]["score"]), 
                         selection_mode="none",
-                        use_container_width=True,
+                        width="stretch",
                         key=f"gauge_ns_{ns}"
                     )
 
-    # Tabela Consolidada Unificada de Pods
     st.markdown("### 📋 Mapeamento de Workloads Ativos")
     if all_pods_accumulated:
         df_pods = pd.DataFrame(all_pods_accumulated)
-        st.dataframe(df_pods, use_container_width=True, hide_index=True)
+        # CORREÇÃO: st.dataframe expande por padrão na versão nova, parâmetro removido/limpo
+        st.dataframe(df_pods, hide_index=True)
     else:
         st.info("Nenhum workload ativo mapeado nos namespaces monitorados.")
 
@@ -257,7 +248,6 @@ def render_monitoring_panel():
                 if scores_dict[ns]["trigger"]:
                     msg_erro = scores_dict[ns]["message"]
                     
-                    # Identifica qual Pod específico disparou o erro neste namespace
                     pods_do_namespace = scores_dict[ns]["pods_lista"]
                     pod_afetado = next((p["Pod"] for p in pods_do_namespace if "❌" in p["Health"]), None)
                     
@@ -266,7 +256,6 @@ def render_monitoring_panel():
                         
                     st.toast(f"🚨 Anomalia em '{ns}' no Pod '{pod_afetado}'! Despertando AgentK...", icon="⚠️")
                     
-                    # BACKUP GENÉTICO: Captura a spec estruturada real direto do K8s antes da deleção
                     spec_original = {}
                     try:
                         raw_pod = k8s.read_resource(resource_type="pod", name=pod_afetado, namespace=ns)
@@ -283,7 +272,6 @@ def render_monitoring_panel():
 
                     spec_str = json.dumps(spec_original, indent=2) if spec_original else "Não foi possível extrair a Spec original."
 
-                    # INTEGRAÇÃO DO MOTOR DE BENCHMARK: Injeta health_checker e timeout de early-stop ativo
                     agent_dinamico = AgentService(
                         llm_provider=adapter, 
                         k8s_adapter=k8s, 

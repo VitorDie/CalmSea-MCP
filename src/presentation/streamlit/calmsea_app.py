@@ -20,7 +20,7 @@ from src.infrastructure.k8s_adapter.service import K8sServiceAdapter
 from src.infrastructure.k8s_adapter.health_checker import K8sHealthChecker
 from src.application.services.agent_service import AgentService
 
-st.set_page_config(page_title="CalmSea SRE Monitor", page_icon="🌊", layout="wide")
+st.set_page_config(page_title="CalmSea", page_icon="🌊", layout="wide")
 
 # 2. Inicialização do Estado da Sessão (Controle de Batimento Cíclico e Cache)
 if "calmsea_collector" not in st.session_state:
@@ -62,7 +62,7 @@ def get_ollama_models():
 
 # --- ORGANISMO: FÁBRICA DE GAUGE PLOTLY ---
 def create_phantom_gauge(title, score):
-    """Gera o velocímetro de integridade baseado no score calculado."""
+    """Gera o velocímetro de integridade baseado no score calculado (Sem título interno para evitar cortes)."""
     fig = go.Figure(go.Indicator(
         mode="gauge+number",
         value=score,
@@ -73,9 +73,9 @@ def create_phantom_gauge(title, score):
             'borderwidth': 2,
             'bordercolor': "gray",
             'steps': [
-                {'range': [0, 40], 'color': '#ff4d4d'},
-                {'range': [40, 80], 'color': '#ffa64d'},
-                {'range': [80, 100], 'color': '#2db300'}
+                {"range": [0, 40], "color": "#ff4d4d"},
+                {"range": [40, 80], "color": "#ffa64d"},
+                {"range": [80, 100], "color": "#2db300"}
             ],
         }
     ))
@@ -203,13 +203,13 @@ def render_monitoring_panel():
             "score": score_ns,
             "trigger": trigger_ns,
             "message": msg_ns,
-            "pods_lista": pods_ns  # Adicionado para mapeamento interno no circuito dinâmico
+            "pods_lista": pods_ns
         }
         all_pods_accumulated.extend(pods_ns)
         
     score_cluster = int(sum(item["score"] for item in scores_dict.values()) / len(scores_dict))
 
-    # Renderização do Gauge Principal
+    # Renderização do Gauge Principal (Ajustado para usar Container e chave estática)
     with st.container(border=True):
         st.markdown("### 📊 Cluster Global Status")
         st.plotly_chart(
@@ -221,7 +221,7 @@ def render_monitoring_panel():
     
     st.markdown("#### ☸️ Distribuição por Namespaces Ativos")
     
-    # Grid responsivo com quebra de linha (Máximo 3 colunas por linha)
+    # Grid responsivo com quebra de linha (Máximo 3 colunas por linha para evitar esmagamento)
     MAX_COLS = 3
     namespaces_lista = list(namespaces_reais)
     
@@ -232,6 +232,7 @@ def render_monitoring_panel():
         for idx, ns in enumerate(grupo_ns):
             with cols_namespaces[idx]:
                 with st.container(border=True):
+                    # Título nativo do Streamlit para evitar que o Plotly corte o texto (...)
                     st.markdown(f"📦 **NS: {ns}**")
                     st.plotly_chart(
                         create_phantom_gauge("", scores_dict[ns]["score"]), 
@@ -248,7 +249,7 @@ def render_monitoring_panel():
     else:
         st.info("Nenhum workload ativo mapeado nos namespaces monitorados.")
 
-    # --- SOBERANIA OPERACIONAL: CIRCUITO DE AUTO-REMEDIAÇÃO TOTALMENTE AGNÓSTICO ---
+    # --- SOBERANIA OPERACIONAL: CIRCUITO DE AUTO-REMEDIAÇÃO DINÂMICO COM WATCHDOG PROTOCOL ---
     if st.session_state.loop_active:
         if time.time() >= st.session_state.next_scan_timestamp:
             
@@ -263,7 +264,7 @@ def render_monitoring_panel():
                     if not pod_afetado:
                         continue
                         
-                    st.toast(f"🚨 Anomalia em '{ns}' no Pod '{pod_afetado}'! Acionando SRE...", icon="⚠️")
+                    st.toast(f"🚨 Anomalia em '{ns}' no Pod '{pod_afetado}'! Despertando AgentK...", icon="⚠️")
                     
                     # BACKUP GENÉTICO: Captura a spec estruturada real direto do K8s antes da deleção
                     spec_original = {}
@@ -282,24 +283,29 @@ def render_monitoring_panel():
 
                     spec_str = json.dumps(spec_original, indent=2) if spec_original else "Não foi possível extrair a Spec original."
 
-                    # Inicialização do serviço injetando o escopo dinâmico
-                    agent_dinamico = AgentService(adapter, k8s, health_checker=checker, target_namespace=ns)
+                    # INTEGRAÇÃO DO MOTOR DE BENCHMARK: Injeta health_checker e timeout de early-stop ativo
+                    agent_dinamico = AgentService(
+                        llm_provider=adapter, 
+                        k8s_adapter=k8s, 
+                        health_checker=checker, 
+                        target_namespace=ns,
+                        early_healthcheck_timeout=25
+                    )
                     
                     with st.spinner(f"AgentK aplicando engenharia de correção em '{ns}' para o pod '{pod_afetado}'..."):
                         agent_dinamico.run(user_prompt=(
-                            f"O monitor passivo CalmSea detectou falhas estruturais de infraestrutura.\n"
-                            f"CONTEXTO DO AMBIENTE:\n"
-                            f"- Namespace: '{ns}'\n"
-                            f"- Nome do Pod Alvo: '{pod_afetado}'\n"
-                            f"- Causa Raiz/Erro: {msg_erro}\n"
-                            f"- Especificação Original (JSON): \n{spec_str}\n\n"
-                            f"EXECUTE RIGOROSAMENTE O CHECKLIST DE REMEDIAÇÃO SRE:\n"
-                            f"1. [RESOLUÇÃO] Chame a ferramenta `delete_resource` para remover o Pod problemático '{pod_afetado}' informando explicitamente namespace='{ns}'.\n"
-                            f"2. [MIGRAÇÃO DE IMAGEM] Analise o erro reportado na causa raiz e na Spec original. Identifique qual imagem causou a falha (ex: tags erradas ou typos) e decida por uma versão estável e oficial correspondente (ex: se o erro for no nginx, mude para 'nginx:latest').\n"
-                            f"3. [REMEDIAÇÃO] Imediatamente após o retorno de sucesso do delete, use a ferramenta `apply_manifest` para recriar o recurso.\n"
-                            f"4. [INTEGRIDADE DO MANIFESTO] O novo manifesto YAML deve ser baseado na Especificação Original fornecida, mantendo obrigatoriamente o tipo 'kind: Pod', o mesmo nome original 'name: {pod_afetado}', as mesmas labels e portas, alterando EXCLUSIVAMENTE o campo 'image' do contêiner com a versão corrigida.\n"
-                            f"5. [RESTRIÇÃO] É terminantemente proibido alterar a topologia para 'Deployment' ou encerrar o fluxo respondendo por texto plano sem executar a tool call do `apply_manifest`. Siga até o fim da esteira."
+                            f"Anomalia crítica detectada no namespace '{ns}' para o recurso Pod '{pod_afetado}'.\n"
+                            f"Telemetria do Erro: {msg_erro}\n"
+                            f"Especificação Atual no Cluster (JSON): \n{spec_str}\n\n"
+                            f"ESTRATÉGIA OBRIGATÓRIA DE SRE (WATCHDOG PROTOCOL):\n"
+                            f"1. [RESOLUÇÃO] Use a ferramenta `get_pod_diagnostics` se precisar coletar eventos profundos ou logs adicionais.\n"
+                            f"2. [ISOLAMENTO] Execute `delete_resource` para remover o Pod problemático '{pod_afetado}' do namespace '{ns}'.\n"
+                            f"3. [REMEDIAÇÃO] Use a ferramenta `apply_manifest` para recriar o Pod baseado na Especificação Original, corrigindo unicamente a tag de imagem corrompida por uma oficial e estável (ex: se o erro for no nginx, use 'nginx:latest'; se for outra aplicação, mude para a correspondente estável).\n"
+                            f"4. [WATCHDOG] Não reaplique manifestos idênticos em loops iterativos. É proibido repetir a mesma tentativa de correção se ela retornar um erro de validação da API.\n"
+                            f"5. [SINAL DE PARADA] Se o `apply_manifest` for bem-sucedido, o motor de HealthCheck validará o ambiente automaticamente. Assim que o ambiente estiver estável, encerre a execução imediatamente (FINALIZE).\n"
+                            f"6. [RESTRIÇÃO] Mantenha rigorosamente o tipo 'kind: Pod' e o nome original 'name: {pod_afetado}'. Não migre para Deployment e não encerre por texto puro (reply) sem ter executado a correção física no cluster."
                         ))
+                        
                     st.toast(f"✅ Ambiente estabilizado em '{ns}'!", icon="⚓")
                     st.session_state.next_scan_timestamp = time.time() + (intervalo * 60)
                     st.rerun()
